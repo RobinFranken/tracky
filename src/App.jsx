@@ -159,11 +159,14 @@ const PriceService = {
   // Map exchange suffixes to Yahoo Finance format
   getYahooSymbol(symbol, exchange) {
     const exMap = { 
-      'XAMS': '.AS', 'XETR': '.DE', 'XLON': '.L', 'XPAR': '.PA', 
+      'XAMS': '.AS', 'XETR': '.DE', 'XLON': '.L', 'XPAR': '.PA', 'XMIL': '.MI',
       'XNAS': '', 'XNYS': '', 'NYSE': '', 'NASDAQ': '',
-      'AS': '.AS', 'DE': '.DE', 'L': '.L', 'PA': '.PA'
+      'AS': '.AS', 'DE': '.DE', 'L': '.L', 'PA': '.PA', 'MI': '.MI',
+      'AMS': '.AS', 'LON': '.L', 'FRA': '.DE', 'PAR': '.PA'
     };
     const suffix = exMap[exchange?.toUpperCase()] || '';
+    // Log mapping for debugging
+    if (suffix) console.log(`[Yahoo] Mapped ${symbol} + ${exchange} → ${symbol}${suffix}`);
     return symbol + suffix;
   },
   
@@ -189,15 +192,25 @@ const PriceService = {
       const quote = data.chart?.result?.[0]?.meta;
       
       if (quote?.regularMarketPrice && quote.regularMarketPrice > 0) {
-        const price = quote.regularMarketPrice;
-        const prevClose = quote.previousClose || quote.chartPreviousClose || price;
-        console.log(`[Yahoo] ${ySymbol} = ${price} ${quote.currency}`);
+        let price = quote.regularMarketPrice;
+        let prevClose = quote.previousClose || quote.chartPreviousClose || price;
+        let currency = quote.currency || 'USD';
+        
+        // UK stocks return prices in pence (GBX/GBp), convert to pounds (GBP)
+        if (currency === 'GBp' || currency === 'GBX') {
+          price = price / 100;
+          prevClose = prevClose / 100;
+          currency = 'GBP';
+          console.log(`[Yahoo] ${ySymbol} converted from pence: ${quote.regularMarketPrice} GBX → ${price} GBP`);
+        }
+        
+        console.log(`[Yahoo] ${ySymbol} = ${price} ${currency}`);
         return {
           price,
           prevClose,
           change: price - prevClose,
           changePct: prevClose > 0 ? ((price - prevClose) / prevClose) * 100 : 0,
-          currency: quote.currency || 'USD',
+          currency,
           source: 'yahoo'
         };
       }
