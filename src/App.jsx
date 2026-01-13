@@ -194,17 +194,31 @@ const PriceService = {
       if (quote?.regularMarketPrice && quote.regularMarketPrice > 0) {
         let price = quote.regularMarketPrice;
         let prevClose = quote.previousClose || quote.chartPreviousClose || price;
-        let currency = quote.currency || 'USD';
+        let currency = (quote.currency || 'USD').toUpperCase();
         
-        // UK stocks return prices in pence (GBX/GBp), convert to pounds (GBP)
-        if (currency === 'GBp' || currency === 'GBX') {
+        console.log(`[Yahoo] ${ySymbol} raw: ${price} ${quote.currency}`);
+        
+        // UK stocks return prices in pence (GBX/GBp/GBP with high values), convert to pounds
+        // Check for GBX, GBp, or GBP with suspiciously high values (>500 suggests pence)
+        const isUKPence = currency === 'GBP' || currency === 'GBX' || currency === 'GBp';
+        const isProbablyPence = isUKPence && price > 500; // Most UK stocks < £500, if >500 it's likely pence
+        
+        // Also check if exchange is London
+        const isLondonStock = exchange?.toUpperCase()?.includes('LON') || exchange?.toUpperCase() === 'XLON' || exchange?.toUpperCase() === 'L';
+        
+        if ((currency === 'GBX' || currency.toLowerCase() === 'gbp') && (isProbablyPence || isLondonStock && price > 100)) {
+          console.log(`[Yahoo] ${ySymbol} detected as UK pence, converting: ${price} pence → ${price/100} GBP`);
           price = price / 100;
           prevClose = prevClose / 100;
           currency = 'GBP';
-          console.log(`[Yahoo] ${ySymbol} converted from pence: ${quote.regularMarketPrice} GBX → ${price} GBP`);
+        } else if (currency === 'GBX') {
+          // Always convert GBX regardless
+          price = price / 100;
+          prevClose = prevClose / 100;
+          currency = 'GBP';
         }
         
-        console.log(`[Yahoo] ${ySymbol} = ${price} ${currency}`);
+        console.log(`[Yahoo] ${ySymbol} final: ${price} ${currency}`);
         return {
           price,
           prevClose,
@@ -363,7 +377,12 @@ const loadStorage = (k, d) => { try { return JSON.parse(localStorage.getItem(k))
 const saveStorage = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 const EUR_RATE = { USD: 0.92, EUR: 1, GBP: 1.17 };
 const toEUR = (amt, ccy) => ccy === 'EUR' ? amt : amt * (EUR_RATE[ccy] || 0.92);
-const fmt = (v, c = 'EUR') => new Intl.NumberFormat('nl-NL', { style: 'currency', currency: c === 'USD' ? 'USD' : 'EUR', minimumFractionDigits: 2 }).format(v);
+const fmt = (v, c = 'EUR') => {
+  const currency = (c || 'EUR').toUpperCase();
+  const supportedCurrencies = ['EUR', 'USD', 'GBP'];
+  const useCurrency = supportedCurrencies.includes(currency) ? currency : 'EUR';
+  return new Intl.NumberFormat('nl-NL', { style: 'currency', currency: useCurrency, minimumFractionDigits: 2 }).format(v);
+};
 const fmtPct = (v) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`;
 const fmtDate = d => d ? new Date(d).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : 'N/A';
 
@@ -1335,6 +1354,16 @@ export default function PortfolioDashboard() {
                 onClick={() => { 
                   localStorage.removeItem('price_cache'); 
                   PriceService.cache = {}; 
+                  // Also reset prices in positions
+                  setPositions(prev => prev.map(p => ({
+                    ...p,
+                    currentPrice: p.avgPrice,
+                    priceChange: 0,
+                    priceChangePct: 0,
+                    priceCurrency: p.currency,
+                    priceSource: null
+                  })));
+                  setLastPriceUpdate(null);
                   alert('Price cache cleared! Click "Update Prices" to fetch fresh data.'); 
                 }} 
                 style={{ ...styles.btn, padding: '8px 14px', fontSize: 12 }}
