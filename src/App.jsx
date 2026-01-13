@@ -129,6 +129,168 @@ const SupabaseService = {
 };
 
 // ======================
+// PRICE SERVICE
+// ======================
+
+const PriceService = {
+  cache: {},
+  cacheTime: 5 * 60 * 1000, // 5 min cache
+  finnhubKey: '',
+  
+  init(finnhubKey = '') {
+    this.finnhubKey = finnhubKey;
+    // Load cache from localStorage
+    try {
+      const cached = JSON.parse(localStorage.getItem('price_cache') || '{}');
+      this.cache = cached;
+    } catch {}
+  },
+  
+  saveCache() {
+    try { localStorage.setItem('price_cache', JSON.stringify(this.cache)); } catch {}
+  },
+  
+  isCached(symbol) {
+    const cached = this.cache[symbol];
+    return cached && (Date.now() - cached.time < this.cacheTime);
+  },
+  
+  // Map exchange suffixes to Yahoo Finance format
+  mapSymbol(symbol, exchange) {
+    const exMap = { 'XAMS': '.AS', 'XETR': '.DE', 'XLON': '.L', 'XPAR': '.PA', 'XNAS': '', 'XNYS': '', 'NYSE': '', 'NASDAQ': '' };
+    const suffix = exMap[exchange?.toUpperCase()] || '';
+    return symbol + suffix;
+  },
+  
+  // Yahoo Finance (works for most stocks via chart API)
+  async fetchYahoo(symbol, exchange) {
+    const ySymbol = this.mapSymbol(symbol, exchange);
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ySymbol}?interval=1d&range=5d`;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const data = await res.json();
+      const quote = data.chart?.result?.[0]?.meta;
+      if (quote?.regularMarketPrice) {
+        return {
+          price: quote.regularMarketPrice,
+          prevClose: quote.previousClose || quote.chartPreviousClose,
+          change: quote.regularMarketPrice - (quote.previousClose || quote.chartPreviousClose || quote.regularMarketPrice),
+          changePct: quote.previousClose ? ((quote.regularMarketPrice - quote.previousClose) / quote.previousClose) * 100 : 0,
+          currency: quote.currency || 'USD',
+          source: 'yahoo'
+        };
+      }
+    } catch (e) { console.log('Yahoo error:', symbol, e.message); }
+    return null;
+  },
+  
+  // Finnhub (US stocks)
+  async fetchFinnhub(symbol) {
+    if (!this.finnhubKey) return null;
+    try {
+      const url = `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${this.finnhubKey}`;
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data.c && data.c > 0) {
+        return {
+          price: data.c,
+          prevClose: data.pc,
+          change: data.d,
+          changePct: data.dp,
+          high: data.h,
+          low: data.l,
+          open: data.o,
+          source: 'finnhub'
+        };
+      }
+    } catch (e) { console.log('Finnhub error:', symbol, e.message); }
+    return null;
+  },
+  
+  // CoinGecko (crypto)
+  async fetchCoinGecko(symbol) {
+    const cryptoMap = { 'BTC': 'bitcoin', 'ETH': 'ethereum', 'SOL': 'solana', 'ADA': 'cardano', 'DOT': 'polkadot', 'DOGE': 'dogecoin', 'XRP': 'ripple', 'LINK': 'chainlink', 'AVAX': 'avalanche-2', 'MATIC': 'matic-network' };
+    const id = cryptoMap[symbol.toUpperCase()];
+    if (!id) return null;
+    try {
+      const url = `https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=eur,usd&include_24hr_change=true`;
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data[id]) {
+        return {
+          price: data[id].eur,
+          priceUSD: data[id].usd,
+          changePct: data[id].eur_24h_change || 0,
+          currency: 'EUR',
+          source: 'coingecko'
+        };
+      }
+    } catch (e) { console.log('CoinGecko error:', symbol, e.message); }
+    return null;
+  },
+  
+  // Main fetch function with fallback
+  async getPrice(symbol, exchange, type) {
+    // Check cache first
+    if (this.isCached(symbol)) {
+      return this.cache[symbol].data;
+    }
+    
+    let result = null;
+    
+    // Try crypto first if it looks like crypto
+    if (type?.toLowerCase() === 'crypto') {
+      result = await this.fetchCoinGecko(symbol);
+    }
+    
+    // Try Yahoo (works for most international stocks)
+    if (!result) {
+      result = await this.fetchYahoo(symbol, exchange);
+    }
+    
+    // Try Finnhub for US stocks
+    if (!result && this.finnhubKey) {
+      result = await this.fetchFinnhub(symbol);
+    }
+    
+    // Cache the result
+    if (result) {
+      this.cache[symbol] = { data: result, time: Date.now() };
+      this.saveCache();
+    }
+    
+    return result;
+  },
+  
+  // Batch fetch all positions
+  async fetchAllPrices(positions, onProgress) {
+    const results = {};
+    let completed = 0;
+    
+    for (const pos of positions) {
+      try {
+        const price = await this.getPrice(pos.symbol, pos.exchange, pos.type);
+        if (price) {
+          results[pos.symbol] = price;
+        }
+        completed++;
+        if (onProgress) onProgress(completed, positions.length);
+        
+        // Small delay to avoid rate limits
+        await new Promise(r => setTimeout(r, 100));
+      } catch (e) {
+        console.error('Price fetch error:', pos.symbol, e);
+      }
+    }
+    
+    return results;
+  }
+};
+
+// ======================
 // HELPERS
 // ======================
 
@@ -196,6 +358,49 @@ export default function PortfolioDashboard() {
   const [sbUrl, setSbUrl] = useState(loadStorage('sb_url', ''));
   const [sbKey, setSbKey] = useState(loadStorage('sb_key', ''));
   const [sbTable, setSbTable] = useState(loadStorage('sb_table', 'transactions'));
+  const [finnhubKey, setFinnhubKey] = useState(loadStorage('finnhub_key', ''));
+  const [priceProgress, setPriceProgress] = useState({ loading: false, current: 0, total: 0 });
+  const [lastPriceUpdate, setLastPriceUpdate] = useState(null);
+
+  // Initialize price service
+  useEffect(() => {
+    PriceService.init(finnhubKey);
+  }, [finnhubKey]);
+
+  // Fetch live prices
+  const fetchPrices = async (positionsToUpdate) => {
+    if (!positionsToUpdate?.length) return;
+    
+    setPriceProgress({ loading: true, current: 0, total: positionsToUpdate.length });
+    
+    try {
+      const prices = await PriceService.fetchAllPrices(positionsToUpdate, (current, total) => {
+        setPriceProgress({ loading: true, current, total });
+      });
+      
+      // Update positions with live prices
+      setPositions(prev => prev.map(p => {
+        const livePrice = prices[p.symbol];
+        if (livePrice) {
+          return {
+            ...p,
+            currentPrice: livePrice.price,
+            priceChange: livePrice.change || 0,
+            priceChangePct: livePrice.changePct || 0,
+            priceCurrency: livePrice.currency || p.currency,
+            priceSource: livePrice.source
+          };
+        }
+        return p;
+      }));
+      
+      setLastPriceUpdate(new Date());
+    } catch (e) {
+      console.error('Price fetch error:', e);
+    }
+    
+    setPriceProgress({ loading: false, current: 0, total: 0 });
+  };
 
   // Load data
   useEffect(() => {
@@ -214,6 +419,11 @@ export default function PortfolioDashboard() {
             setStats(p.stats);
             setSource('supabase');
             setLastUpdate(new Date());
+            
+            // Auto-fetch prices after loading
+            if (p.positions.length > 0) {
+              setTimeout(() => fetchPrices(p.positions), 500);
+            }
           }
         } catch (e) { console.error(e); }
       }
@@ -238,6 +448,11 @@ export default function PortfolioDashboard() {
         setSource('supabase');
         setLastUpdate(new Date());
         setStatus({ state: 'success', msg: `✓ Synced ${raw.length} transactions` });
+        
+        // Fetch live prices after loading positions
+        if (p.positions.length > 0) {
+          setTimeout(() => fetchPrices(p.positions), 500);
+        }
       }
     } catch (e) { setStatus({ state: 'error', msg: e.message }); }
     setTimeout(() => setStatus({ state: 'idle', msg: '' }), 5000);
@@ -247,6 +462,8 @@ export default function PortfolioDashboard() {
     saveStorage('sb_url', sbUrl);
     saveStorage('sb_key', sbKey);
     saveStorage('sb_table', sbTable);
+    saveStorage('finnhub_key', finnhubKey);
+    PriceService.init(finnhubKey);
     if (sbUrl && sbKey) { SupabaseService.init(sbUrl, sbKey, sbTable); sync(); }
     setShowSettings(false);
   };
@@ -462,14 +679,22 @@ export default function PortfolioDashboard() {
                 {source === 'supabase' ? '☁️ Cloud Synced' : '💾 Local'}
               </span>
             </div>
-            {lastUpdate && <p style={{ fontSize: 12, color: '#6b7280', margin: '4px 0 0' }}>Updated {lastUpdate.toLocaleTimeString()}</p>}
+            {lastUpdate && <p style={{ fontSize: 12, color: '#6b7280', margin: '4px 0 0' }}>Data: {lastUpdate.toLocaleTimeString()} {lastPriceUpdate && `• Prices: ${lastPriceUpdate.toLocaleTimeString()}`}</p>}
           </div>
         </div>
         <div style={{ display: 'flex', gap: 12 }}>
+          {priceProgress.loading && (
+            <span style={{ padding: '10px 16px', fontSize: 13, color: '#6b7280' }}>
+              📊 Fetching prices... {priceProgress.current}/{priceProgress.total}
+            </span>
+          )}
+          <button style={styles.btn} onClick={() => fetchPrices(positions)} disabled={priceProgress.loading || !positions.length}>
+            💹 Update Prices
+          </button>
           <button style={styles.btn} onClick={sync} disabled={status.state === 'loading'}>
             {status.state === 'loading' ? '⏳ Syncing...' : '🔄 Refresh'}
           </button>
-          <button style={styles.btn} onClick={() => setShowSettings(true)}>⚙️ Settings</button>
+          <button style={styles.btn} onClick={() => setShowSettings(true)}>⚙️</button>
         </div>
       </header>
 
@@ -580,20 +805,34 @@ export default function PortfolioDashboard() {
             <div style={styles.chartCard}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
                 <h3 style={styles.chartTitle}>Top Holdings</h3>
-                <button onClick={() => setActiveTab('holdings')} style={{ ...styles.btn, padding: '8px 16px', fontSize: 13 }}>View All →</button>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button onClick={() => fetchPrices(positions)} disabled={priceProgress.loading} style={{ ...styles.btn, padding: '8px 14px', fontSize: 12 }}>
+                    {priceProgress.loading ? '...' : '💹 Prices'}
+                  </button>
+                  <button onClick={() => setActiveTab('holdings')} style={{ ...styles.btn, padding: '8px 14px', fontSize: 12 }}>View All →</button>
+                </div>
               </div>
               {[...positions].sort((a, b) => toEUR(b.shares * b.currentPrice, b.currency) - toEUR(a.shares * a.currentPrice, a.currency)).slice(0, 5).map((p, idx) => (
                 <div key={p.symbol} onClick={() => setSelectedPosition(p)} style={styles.row} onMouseOver={e => Object.assign(e.currentTarget.style, styles.rowHover)} onMouseOut={e => Object.assign(e.currentTarget.style, { backgroundColor: '#0a0d14', borderColor: 'transparent' })}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
                     <div style={{ width: 44, height: 44, borderRadius: 12, background: `linear-gradient(135deg, ${COLORS[idx % COLORS.length]}40, ${COLORS[idx % COLORS.length]}20)`, border: `1px solid ${COLORS[idx % COLORS.length]}50`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 12, color: COLORS[idx % COLORS.length] }}>{p.symbol.slice(0, 4)}</div>
                     <div>
-                      <p style={{ fontWeight: 600, margin: 0, fontSize: 15 }}>{p.symbol}</p>
-                      <p style={{ fontSize: 13, color: '#6b7280', margin: '2px 0 0' }}>{p.shares.toFixed(2)} shares @ {fmt(p.avgPrice, p.currency)}</p>
+                      <p style={{ fontWeight: 600, margin: 0, fontSize: 15 }}>
+                        {p.symbol}
+                        {p.priceSource && <span style={{ fontSize: 10, color: '#6366f1', marginLeft: 8 }}>● LIVE</span>}
+                      </p>
+                      <p style={{ fontSize: 13, color: '#6b7280', margin: '2px 0 0' }}>{p.shares.toFixed(2)} @ {fmt(p.currentPrice, p.priceCurrency || p.currency)}</p>
                     </div>
                   </div>
                   <div style={{ textAlign: 'right' }}>
-                    <p style={{ fontWeight: 600, margin: 0, fontSize: 16 }}>{fmt(toEUR(p.shares * p.currentPrice, p.currency))}</p>
-                    <p style={{ fontSize: 13, color: '#6b7280', margin: '2px 0 0' }}>{((toEUR(p.shares * p.currentPrice, p.currency) / metrics.val) * 100).toFixed(1)}%</p>
+                    <p style={{ fontWeight: 600, margin: 0, fontSize: 16 }}>{fmt(toEUR(p.shares * p.currentPrice, p.priceCurrency || p.currency))}</p>
+                    {p.priceChangePct !== undefined && p.priceChangePct !== 0 ? (
+                      <p style={{ fontSize: 13, color: p.priceChangePct >= 0 ? '#34d399' : '#f87171', margin: '2px 0 0' }}>
+                        {p.priceChangePct >= 0 ? '▲' : '▼'} {Math.abs(p.priceChangePct).toFixed(2)}%
+                      </p>
+                    ) : (
+                      <p style={{ fontSize: 13, color: '#6b7280', margin: '2px 0 0' }}>{((toEUR(p.shares * p.currentPrice, p.currency) / metrics.val) * 100).toFixed(1)}%</p>
+                    )}
                   </div>
                 </div>
               ))}
@@ -604,21 +843,37 @@ export default function PortfolioDashboard() {
         {/* HOLDINGS TAB */}
         {activeTab === 'holdings' && (
           <div style={styles.chartCard}>
-            <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>All Holdings ({positions.length})</h3>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+              <h3 style={styles.chartTitle}>All Holdings ({positions.length})</h3>
+              <button onClick={() => fetchPrices(positions)} disabled={priceProgress.loading} style={{ ...styles.btn, padding: '8px 16px', fontSize: 13 }}>
+                {priceProgress.loading ? `Updating ${priceProgress.current}/${priceProgress.total}...` : '💹 Update Prices'}
+              </button>
+            </div>
             {[...positions].sort((a, b) => toEUR(b.shares * b.currentPrice, b.currency) - toEUR(a.shares * a.currentPrice, a.currency)).map((p, idx) => (
               <div key={p.symbol} onClick={() => setSelectedPosition(p)} style={styles.row} onMouseOver={e => Object.assign(e.currentTarget.style, styles.rowHover)} onMouseOut={e => Object.assign(e.currentTarget.style, { backgroundColor: '#0a0d14', borderColor: 'transparent' })}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
                   <div style={{ width: 48, height: 48, borderRadius: 12, background: `linear-gradient(135deg, ${COLORS[idx % COLORS.length]}40, ${COLORS[idx % COLORS.length]}20)`, border: `1px solid ${COLORS[idx % COLORS.length]}50`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 12, color: COLORS[idx % COLORS.length] }}>{p.symbol.slice(0, 4)}</div>
                   <div>
-                    <p style={{ fontWeight: 600, margin: 0, fontSize: 15 }}>{p.symbol} <span style={{ fontSize: 12, color: '#6b7280', fontWeight: 400 }}>{p.type}</span></p>
-                    <p style={{ fontSize: 13, color: '#6b7280', margin: '2px 0 0' }}>{p.shares.toFixed(4)} shares @ {fmt(p.avgPrice, p.currency)}</p>
+                    <p style={{ fontWeight: 600, margin: 0, fontSize: 15 }}>
+                      {p.symbol} <span style={{ fontSize: 12, color: '#6b7280', fontWeight: 400 }}>{p.type}</span>
+                      {p.priceSource && <span style={{ fontSize: 10, color: '#6366f1', marginLeft: 8 }}>● LIVE</span>}
+                    </p>
+                    <p style={{ fontSize: 13, color: '#6b7280', margin: '2px 0 0' }}>
+                      {p.shares.toFixed(4)} shares • Avg: {fmt(p.avgPrice, p.currency)} • Now: {fmt(p.currentPrice, p.priceCurrency || p.currency)}
+                    </p>
                   </div>
                 </div>
                 <div style={{ textAlign: 'right' }}>
-                  <p style={{ fontWeight: 600, margin: 0, fontSize: 16 }}>{fmt(toEUR(p.shares * p.currentPrice, p.currency))}</p>
-                  <p style={{ fontSize: 13, color: gains.bySymbol.find(g => g.symbol === p.symbol)?.unrealized >= 0 ? '#34d399' : '#f87171', margin: '2px 0 0' }}>
-                    {fmt(gains.bySymbol.find(g => g.symbol === p.symbol)?.unrealized || 0)} unrealized
-                  </p>
+                  <p style={{ fontWeight: 600, margin: 0, fontSize: 16 }}>{fmt(toEUR(p.shares * p.currentPrice, p.priceCurrency || p.currency))}</p>
+                  {p.priceChangePct !== undefined && p.priceChangePct !== 0 ? (
+                    <p style={{ fontSize: 13, color: p.priceChangePct >= 0 ? '#34d399' : '#f87171', margin: '2px 0 0' }}>
+                      {p.priceChangePct >= 0 ? '▲' : '▼'} {Math.abs(p.priceChangePct).toFixed(2)}% today
+                    </p>
+                  ) : (
+                    <p style={{ fontSize: 13, color: gains.bySymbol.find(g => g.symbol === p.symbol)?.unrealized >= 0 ? '#34d399' : '#f87171', margin: '2px 0 0' }}>
+                      {fmt(gains.bySymbol.find(g => g.symbol === p.symbol)?.unrealized || 0)} unrealized
+                    </p>
+                  )}
                 </div>
               </div>
             ))}
@@ -906,7 +1161,10 @@ export default function PortfolioDashboard() {
           <div style={{ ...styles.modalContent, maxWidth: 700 }} onClick={e => e.stopPropagation()}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
               <div>
-                <h3 style={{ fontSize: 26, fontWeight: 700, margin: 0 }}>{selectedPosition.symbol}</h3>
+                <h3 style={{ fontSize: 26, fontWeight: 700, margin: 0 }}>
+                  {selectedPosition.symbol}
+                  {selectedPosition.priceSource && <span style={{ fontSize: 12, color: '#6366f1', marginLeft: 12, fontWeight: 500 }}>● LIVE</span>}
+                </h3>
                 <p style={{ color: '#6b7280', margin: '6px 0 0', fontSize: 14 }}>{selectedPosition.type} • {selectedPosition.exchange || 'Unknown Exchange'}</p>
               </div>
               <button onClick={() => setSelectedPosition(null)} style={{ ...styles.btn, padding: '8px 14px', fontSize: 16 }}>✕</button>
@@ -918,27 +1176,41 @@ export default function PortfolioDashboard() {
                 <p style={{ color: '#fff', fontSize: 24, fontWeight: 700, margin: '6px 0 0' }}>{selectedPosition.shares.toFixed(4)}</p>
               </div>
               <div style={{ padding: 20, borderRadius: 14, backgroundColor: '#0a0d14' }}>
-                <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Average Price</p>
+                <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Average Cost</p>
                 <p style={{ color: '#fff', fontSize: 24, fontWeight: 700, margin: '6px 0 0' }}>{fmt(selectedPosition.avgPrice, selectedPosition.currency)}</p>
               </div>
               <div style={{ padding: 20, borderRadius: 14, backgroundColor: '#0a0d14' }}>
-                <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Cost Basis</p>
-                <p style={{ color: '#fff', fontSize: 24, fontWeight: 700, margin: '6px 0 0' }}>{fmt(selectedPosition.shares * selectedPosition.avgPrice, selectedPosition.currency)}</p>
+                <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Current Price</p>
+                <p style={{ color: '#fff', fontSize: 24, fontWeight: 700, margin: '6px 0 0' }}>{fmt(selectedPosition.currentPrice, selectedPosition.priceCurrency || selectedPosition.currency)}</p>
+                {selectedPosition.priceChangePct !== undefined && selectedPosition.priceChangePct !== 0 && (
+                  <p style={{ color: selectedPosition.priceChangePct >= 0 ? '#34d399' : '#f87171', fontSize: 13, margin: '4px 0 0' }}>
+                    {selectedPosition.priceChangePct >= 0 ? '▲' : '▼'} {Math.abs(selectedPosition.priceChangePct).toFixed(2)}% today
+                  </p>
+                )}
               </div>
               <div style={{ padding: 20, borderRadius: 14, backgroundColor: '#0a0d14' }}>
-                <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Current Value</p>
-                <p style={{ color: '#fff', fontSize: 24, fontWeight: 700, margin: '6px 0 0' }}>{fmt(toEUR(selectedPosition.shares * selectedPosition.currentPrice, selectedPosition.currency))}</p>
+                <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Market Value</p>
+                <p style={{ color: '#fff', fontSize: 24, fontWeight: 700, margin: '6px 0 0' }}>{fmt(toEUR(selectedPosition.shares * selectedPosition.currentPrice, selectedPosition.priceCurrency || selectedPosition.currency))}</p>
               </div>
             </div>
             
-            {gains.bySymbol.find(g => g.symbol === selectedPosition.symbol) && (
-              <div style={{ padding: 20, borderRadius: 14, backgroundColor: 'rgba(52,211,153,0.1)', border: '1px solid rgba(52,211,153,0.2)', marginBottom: 24 }}>
-                <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Unrealized Gain/Loss</p>
-                <p style={{ color: gains.bySymbol.find(g => g.symbol === selectedPosition.symbol).unrealized >= 0 ? '#34d399' : '#f87171', fontSize: 26, fontWeight: 700, margin: '6px 0 0' }}>
-                  {fmt(gains.bySymbol.find(g => g.symbol === selectedPosition.symbol).unrealized)}
-                </p>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 24 }}>
+              <div style={{ padding: 20, borderRadius: 14, backgroundColor: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.2)' }}>
+                <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Cost Basis</p>
+                <p style={{ color: '#fff', fontSize: 22, fontWeight: 600, margin: '6px 0 0' }}>{fmt(selectedPosition.shares * selectedPosition.avgPrice, selectedPosition.currency)}</p>
               </div>
-            )}
+              {gains.bySymbol.find(g => g.symbol === selectedPosition.symbol) && (
+                <div style={{ padding: 20, borderRadius: 14, backgroundColor: gains.bySymbol.find(g => g.symbol === selectedPosition.symbol).unrealized >= 0 ? 'rgba(52,211,153,0.1)' : 'rgba(248,113,113,0.1)', border: `1px solid ${gains.bySymbol.find(g => g.symbol === selectedPosition.symbol).unrealized >= 0 ? 'rgba(52,211,153,0.2)' : 'rgba(248,113,113,0.2)'}` }}>
+                  <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Unrealized P&L</p>
+                  <p style={{ color: gains.bySymbol.find(g => g.symbol === selectedPosition.symbol).unrealized >= 0 ? '#34d399' : '#f87171', fontSize: 22, fontWeight: 600, margin: '6px 0 0' }}>
+                    {fmt(gains.bySymbol.find(g => g.symbol === selectedPosition.symbol).unrealized)}
+                    <span style={{ fontSize: 14, fontWeight: 400, marginLeft: 8 }}>
+                      ({((gains.bySymbol.find(g => g.symbol === selectedPosition.symbol).unrealized / (selectedPosition.shares * selectedPosition.avgPrice)) * 100).toFixed(1)}%)
+                    </span>
+                  </p>
+                </div>
+              )}
+            </div>
             
             <h4 style={{ color: '#fff', marginBottom: 14, fontWeight: 600 }}>Transaction History</h4>
             <div style={{ maxHeight: 280, overflowY: 'auto' }}>
@@ -960,13 +1232,26 @@ export default function PortfolioDashboard() {
       {showSettings && (
         <div style={styles.modal} onClick={() => setShowSettings(false)}>
           <div style={styles.modalContent} onClick={e => e.stopPropagation()}>
-            <h3 style={{ fontSize: 22, fontWeight: 700, marginBottom: 24 }}>⚙️ Supabase Settings</h3>
-            <label style={styles.inputLabel}>Project URL</label>
-            <input type="text" value={sbUrl} onChange={e => setSbUrl(e.target.value)} style={styles.input} placeholder="https://xxxxx.supabase.co" />
-            <label style={styles.inputLabel}>Anon Key</label>
-            <input type="password" value={sbKey} onChange={e => setSbKey(e.target.value)} style={styles.input} placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." />
-            <label style={styles.inputLabel}>Table Name</label>
-            <input type="text" value={sbTable} onChange={e => setSbTable(e.target.value)} style={styles.input} placeholder="transactions" />
+            <h3 style={{ fontSize: 22, fontWeight: 700, marginBottom: 24 }}>⚙️ Settings</h3>
+            
+            <div style={{ marginBottom: 24, padding: 16, borderRadius: 12, backgroundColor: '#0a0d14' }}>
+              <h4 style={{ color: '#fff', margin: '0 0 16px', fontSize: 16 }}>☁️ Supabase Connection</h4>
+              <label style={styles.inputLabel}>Project URL</label>
+              <input type="text" value={sbUrl} onChange={e => setSbUrl(e.target.value)} style={styles.input} placeholder="https://xxxxx.supabase.co" />
+              <label style={styles.inputLabel}>Anon Key</label>
+              <input type="password" value={sbKey} onChange={e => setSbKey(e.target.value)} style={styles.input} placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." />
+              <label style={styles.inputLabel}>Table Name</label>
+              <input type="text" value={sbTable} onChange={e => setSbTable(e.target.value)} style={{...styles.input, marginBottom: 0}} placeholder="transactions" />
+            </div>
+            
+            <div style={{ marginBottom: 24, padding: 16, borderRadius: 12, backgroundColor: '#0a0d14' }}>
+              <h4 style={{ color: '#fff', margin: '0 0 16px', fontSize: 16 }}>💹 Live Prices</h4>
+              <label style={styles.inputLabel}>Finnhub API Key (optional, for US stocks)</label>
+              <input type="password" value={finnhubKey} onChange={e => setFinnhubKey(e.target.value)} style={{...styles.input, marginBottom: 8}} placeholder="Enter your Finnhub API key..." />
+              <p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>
+                Get a free key at <a href="https://finnhub.io" target="_blank" rel="noopener noreferrer" style={{ color: '#6366f1' }}>finnhub.io</a> • Yahoo Finance is used as fallback for all stocks
+              </p>
+            </div>
             
             {source === 'supabase' && (
               <div style={{ padding: 14, borderRadius: 12, backgroundColor: 'rgba(52,211,153,0.1)', border: '1px solid rgba(52,211,153,0.2)', marginBottom: 16 }}>
