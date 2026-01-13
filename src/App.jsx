@@ -118,22 +118,24 @@ const SupabaseService = {
     );
     
     sorted.forEach((tx, index) => {
-      const symbol = tx.symbol;
-      const assetType = tx.asset_type?.toLowerCase() || '';
-      const txType = tx.transaction_type?.toLowerCase() || '';
+      const symbol = tx.symbol || '';
+      const assetType = (tx.asset_type || '').toLowerCase();
+      const txType = (tx.transaction_type || '').toLowerCase();
+      const quantity = parseFloat(tx.quantity) || 0;
+      const pricePerUnit = parseFloat(tx.price_per_unit) || 0;
       
       // Skip cash flow entries
-      if (symbol === 'Cash' || assetType === 'cash') return;
+      if (symbol.toLowerCase() === 'cash' || assetType === 'cash') return;
       
-      // Handle Fees
-      if (symbol === 'Fee' || assetType === 'expense') {
+      // Handle Fees (symbol = 'Fee' or asset_type = 'Expense')
+      if (symbol.toLowerCase() === 'fee' || assetType === 'expense') {
         fees.push({
-          id: index + 1,
+          id: `fee-${index}`,
           type: 'Transaction Fee',
-          amount: Math.abs(tx.price_per_unit || 0),
+          amount: Math.abs(pricePerUnit),
           currency: tx.currency || 'EUR',
           date: tx.transaction_date,
-          description: `Trade fee`,
+          description: 'Trade fee',
           positionId: null
         });
         return;
@@ -142,9 +144,9 @@ const SupabaseService = {
       // Handle Tax (withholding tax on dividends)
       if (assetType === 'tax' || txType === 'withholding tax') {
         fees.push({
-          id: index + 1,
+          id: `tax-${index}`,
           type: 'Withholding Tax',
-          amount: Math.abs(tx.price_per_unit || 0),
+          amount: Math.abs(pricePerUnit),
           currency: tx.currency || 'EUR',
           date: tx.transaction_date,
           description: `Dividend withholding tax - ${symbol}`,
@@ -153,12 +155,16 @@ const SupabaseService = {
         return;
       }
       
-      // Handle Dividends
+      // Handle Dividends (asset_type or transaction_type = 'Cash Dividends')
       if (assetType === 'cash dividends' || txType === 'cash dividends') {
+        const cleanSymbol = symbol.split(':')[0];
+        // For dividends, price_per_unit is usually the total amount, quantity is often 0
+        const dividendAmount = quantity === 0 ? Math.abs(pricePerUnit) : Math.abs(pricePerUnit * quantity);
         dividends.push({
-          id: index + 1,
-          symbol: symbol.split(':')[0], // Remove exchange suffix
-          amount: Math.abs(tx.price_per_unit || 0) * Math.abs(tx.quantity || 1),
+          id: `div-${index}`,
+          symbol: cleanSymbol,
+          fullSymbol: symbol,
+          amount: dividendAmount,
           currency: tx.currency || 'EUR',
           date: tx.transaction_date,
           type: 'Dividend'
@@ -166,81 +172,106 @@ const SupabaseService = {
         return;
       }
       
-      // Handle Stock/ETF trades
-      if (['stock', 'etf'].includes(assetType) || ['buy', 'sell'].includes(txType)) {
-        const cleanSymbol = symbol.split(':')[0]; // Remove exchange suffix like :xams, :xnas
-        const exchange = symbol.includes(':') ? symbol.split(':')[1] : '';
-        const quantity = tx.quantity || 0;
-        const price = tx.price_per_unit || 0;
-        const isBuy = quantity > 0 || txType === 'buy';
-        const isSell = quantity < 0 || txType === 'sell';
+      // Handle Stock/ETF trades (including Transfer in)
+      const isTrade = ['stock', 'etf', 'equity'].includes(assetType) || 
+                      ['buy', 'sell', 'transfer in', 'transfer out'].includes(txType);
+      
+      if (isTrade && pricePerUnit > 0) {
+        const cleanSymbol = symbol.split(':')[0];
+        const exchange = symbol.includes(':') ? symbol.split(':')[1].toUpperCase() : '';
+        
+        // Determine if buy or sell
+        // Buy: positive quantity, or txType is 'buy' or 'transfer in'
+        // Sell: negative quantity, or txType is 'sell' or 'transfer out'
+        const isBuy = quantity > 0 || txType === 'buy' || txType === 'transfer in';
+        const isSell = quantity < 0 || txType === 'sell' || txType === 'transfer out';
+        
+        const absQuantity = Math.abs(quantity);
+        const absPrice = Math.abs(pricePerUnit);
+        
+        // Skip if no quantity
+        if (absQuantity === 0) return;
         
         // Record trade
         trades.push({
-          id: index + 1,
+          id: `trade-${index}`,
           symbol: cleanSymbol,
           fullSymbol: symbol,
           type: isBuy ? 'buy' : 'sell',
-          shares: Math.abs(quantity),
-          price: Math.abs(price),
+          shares: absQuantity,
+          price: absPrice,
           date: tx.transaction_date,
-          fee: 0, // Fees are separate rows
+          fee: 0,
           currency: tx.currency || 'EUR',
-          exchange: exchange
+          exchange: exchange,
+          originalType: txType
         });
         
-        // Update position
+        // Initialize position if needed
         if (!positions[cleanSymbol]) {
           positions[cleanSymbol] = {
             symbol: cleanSymbol,
             fullSymbol: symbol,
-            name: cleanSymbol, // Will be enriched later
+            name: cleanSymbol,
             type: assetType === 'etf' ? 'ETF' : 'Stock',
             shares: 0,
             totalCost: 0,
             avgPrice: 0,
             currency: tx.currency || 'EUR',
             exchange: exchange,
-            trades: []
+            trades: [],
+            firstBuyDate: null
           };
         }
         
         const pos = positions[cleanSymbol];
         
         if (isBuy) {
-          const newTotalCost = pos.totalCost + (Math.abs(quantity) * Math.abs(price));
-          const newShares = pos.shares + Math.abs(quantity);
+          const newTotalCost = pos.totalCost + (absQuantity * absPrice);
+          const newShares = pos.shares + absQuantity;
           pos.shares = newShares;
           pos.totalCost = newTotalCost;
           pos.avgPrice = newShares > 0 ? newTotalCost / newShares : 0;
+          if (!pos.firstBuyDate) pos.firstBuyDate = tx.transaction_date;
         } else if (isSell) {
-          const sharesToSell = Math.abs(quantity);
-          const costBasisSold = sharesToSell * pos.avgPrice;
-          pos.shares = Math.max(0, pos.shares - sharesToSell);
+          // FIFO: reduce cost basis proportionally
+          const costBasisSold = absQuantity * pos.avgPrice;
+          pos.shares = Math.max(0, pos.shares - absQuantity);
           pos.totalCost = Math.max(0, pos.totalCost - costBasisSold);
+          // avgPrice stays the same after sells
         }
         
         pos.trades.push(trades[trades.length - 1]);
       }
     });
     
-    // Convert positions object to array, filter out zero positions
+    // Convert positions to array, filter out closed positions
     const positionsArray = Object.values(positions)
-      .filter(p => p.shares > 0.0001) // Keep positions with shares
+      .filter(p => p.shares > 0.0001)
       .map((p, index) => ({
         id: index + 1,
         symbol: p.symbol,
         fullSymbol: p.fullSymbol,
-        name: p.name,
+        name: p.symbol, // Will show symbol as name
         type: p.type,
         shares: p.shares,
         avgPrice: p.avgPrice,
-        currentPrice: p.avgPrice, // Will be updated with live prices
+        currentPrice: p.avgPrice, // Default to avgPrice, will be updated by API
         currency: p.currency,
         dividendYield: 0,
         exchange: p.exchange,
-        purchaseDate: p.trades[0]?.date || null
+        purchaseDate: p.firstBuyDate,
+        totalCost: p.totalCost
       }));
+    
+    console.log('Processed transactions:', {
+      totalTx: rawTransactions.length,
+      positions: positionsArray.length,
+      trades: trades.length,
+      fees: fees.length,
+      dividends: dividends.length,
+      totalDividendAmount: dividends.reduce((s, d) => s + d.amount, 0)
+    });
     
     return { positions: positionsArray, trades, fees, dividends };
   }
@@ -732,22 +763,24 @@ export default function PortfolioDashboard() {
   }, [fees, trades, positions]);
 
   const portfolioMetrics = useMemo(() => {
-    let totalValue = 0, totalCost = 0, totalDividends = 0, dayChange = 0;
+    let totalValue = 0, totalCost = 0, projectedDividends = 0, dayChange = 0;
     positions.forEach(p => {
       const currentValue = p.shares * p.currentPrice; const costBasis = p.shares * p.avgPrice;
       const annualDividend = currentValue * (p.dividendYield / 100); const dailyChange = p.shares * (p.priceChange || 0);
       totalValue += toEUR(currentValue, p.currency); totalCost += toEUR(costBasis, p.currency);
-      totalDividends += toEUR(annualDividend, p.currency); dayChange += toEUR(dailyChange, p.currency);
+      projectedDividends += toEUR(annualDividend, p.currency); dayChange += toEUR(dailyChange, p.currency);
     });
+    // Sum actual received dividends from transactions
+    const totalReceivedDividends = receivedDividends.reduce((sum, d) => sum + toEUR(d.amount, d.currency), 0);
     const grossReturn = totalCost > 0 ? ((totalValue - totalCost) / totalCost) * 100 : 0;
     const grossGainLoss = totalValue - totalCost; const netGainLoss = grossGainLoss - totalFeesEUR;
     const netReturn = totalCost > 0 ? ((totalValue - totalCost - totalFeesEUR) / totalCost) * 100 : 0;
-    const dividendYield = totalValue > 0 ? (totalDividends / totalValue) * 100 : 0;
+    const dividendYield = totalValue > 0 ? (projectedDividends / totalValue) * 100 : 0;
     const dayChangePercent = (totalValue - dayChange) > 0 ? (dayChange / (totalValue - dayChange)) * 100 : 0;
     let periodReturn = 0, periodReturnPercent = 0;
     if (historicalData.length >= 2) { const startValue = historicalData[0].value; const endValue = historicalData[historicalData.length - 1].value; periodReturn = endValue - startValue; periodReturnPercent = startValue > 0 ? ((endValue - startValue) / startValue) * 100 : 0; }
-    return { totalValue, totalCost, grossReturn, grossGainLoss, netReturn, netGainLoss, totalFees: totalFeesEUR, totalDividends, dividendYield, dayChange, dayChangePercent, periodReturn, periodReturnPercent };
-  }, [positions, historicalData, totalFeesEUR]);
+    return { totalValue, totalCost, grossReturn, grossGainLoss, netReturn, netGainLoss, totalFees: totalFeesEUR, totalDividends: totalReceivedDividends, projectedDividends, dividendYield, dayChange, dayChangePercent, periodReturn, periodReturnPercent };
+  }, [positions, historicalData, totalFeesEUR, receivedDividends]);
 
   const yearlyPerformance = useMemo(() => generateYearlyPerformance(positions), [positions]);
   const positionYearlyPerformance = useMemo(() => generatePositionYearlyPerformance(positions), [positions]);
@@ -1203,9 +1236,9 @@ export default function PortfolioDashboard() {
                 <p style={{ ...styles.cardSubtext, color: portfolioMetrics.netReturn >= 0 ? '#34d399' : '#f87171' }}>{formatPercent(portfolioMetrics.netReturn)} after fees</p>
               </div>
               <div style={styles.card}>
-                <p style={styles.cardLabel}>Annual Dividends</p>
+                <p style={styles.cardLabel}>Dividends Received</p>
                 <p style={styles.cardValue}>{formatCurrency(portfolioMetrics.totalDividends)}</p>
-                <p style={{ ...styles.cardSubtext, color: '#34d399' }}>{portfolioMetrics.dividendYield.toFixed(2)}% yield</p>
+                <p style={{ ...styles.cardSubtext, color: '#34d399' }}>from {receivedDividends.length} payments</p>
               </div>
               <div style={styles.card}>
                 <p style={styles.cardLabel}>Total Fees Paid</p>
@@ -1266,7 +1299,7 @@ export default function PortfolioDashboard() {
                     </div>
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 48 }}>
-                    <div style={{ textAlign: 'right' }}><p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>Price</p><p style={{ fontFamily: 'monospace', color: '#ffffff', margin: '2px 0' }}>{formatCurrency(position.currentPrice, position.currency)}</p><p style={{ fontSize: 12, color: (position.priceChangePercent || 0) >= 0 ? '#34d399' : '#f87171', margin: 0 }}>{formatPercent(position.priceChangePercent || 0)}</p></div>
+                    <div style={{ textAlign: 'right' }}><p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>Avg Cost</p><p style={{ fontFamily: 'monospace', color: '#ffffff', margin: '2px 0' }}>{formatCurrency(position.avgPrice, position.currency)}</p><p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>{position.shares.toFixed(position.shares < 1 ? 4 : 2)} shares</p></div>
                     <div style={{ textAlign: 'right' }}><p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>Value</p><p style={{ fontWeight: 500, color: '#ffffff', margin: '2px 0' }}>{formatCurrency(position.valueEUR)}</p><p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>{position.weight.toFixed(1)}%</p></div>
                     <div style={{ textAlign: 'right', minWidth: 100 }}><p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>Net Return</p><p style={{ fontWeight: 500, color: position.netReturnPct >= 0 ? '#34d399' : '#f87171', margin: '2px 0' }}>{formatPercent(position.netReturnPct)}</p><p style={{ fontSize: 12, color: position.netGainLoss >= 0 ? '#34d399' : '#f87171', margin: 0 }}>{formatCurrency(position.netGainLoss)}</p></div>
                     <div style={{ color: '#6b7280' }}><svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg></div>
@@ -1726,32 +1759,52 @@ export default function PortfolioDashboard() {
         {activeTab === 'dividends' && (
           <div>
             <div style={{ ...styles.grid4, marginBottom: 24 }}>
-              <div style={{ ...styles.card, background: 'linear-gradient(135deg, rgba(52,211,153,0.15), rgba(16,185,129,0.1))', borderColor: 'rgba(52,211,153,0.3)' }}><p style={styles.cardLabel}>Annual Income</p><p style={{ ...styles.cardValue, color: '#34d399' }}>{formatCurrency(portfolioMetrics.totalDividends)}</p></div>
-              <div style={styles.card}><p style={styles.cardLabel}>Monthly Average</p><p style={styles.cardValue}>{formatCurrency(portfolioMetrics.totalDividends / 12)}</p></div>
-              <div style={styles.card}><p style={styles.cardLabel}>Portfolio Yield</p><p style={styles.cardValue}>{portfolioMetrics.dividendYield.toFixed(2)}%</p></div>
-              <div style={styles.card}><p style={styles.cardLabel}>Next Payment</p><p style={styles.cardValue}>{dividendCalendar.length > 0 ? formatDate(dividendCalendar[0].nextDate) : 'N/A'}</p></div>
+              <div style={{ ...styles.card, background: 'linear-gradient(135deg, rgba(52,211,153,0.15), rgba(16,185,129,0.1))', borderColor: 'rgba(52,211,153,0.3)' }}><p style={styles.cardLabel}>Total Received</p><p style={{ ...styles.cardValue, color: '#34d399' }}>{formatCurrency(portfolioMetrics.totalDividends)}</p></div>
+              <div style={styles.card}><p style={styles.cardLabel}>Payments</p><p style={styles.cardValue}>{receivedDividends.length}</p></div>
+              <div style={styles.card}><p style={styles.cardLabel}>This Year</p><p style={styles.cardValue}>{formatCurrency(receivedDividends.filter(d => new Date(d.date).getFullYear() === new Date().getFullYear()).reduce((sum, d) => sum + toEUR(d.amount, d.currency), 0))}</p></div>
+              <div style={styles.card}><p style={styles.cardLabel}>Last Year</p><p style={styles.cardValue}>{formatCurrency(receivedDividends.filter(d => new Date(d.date).getFullYear() === new Date().getFullYear() - 1).reduce((sum, d) => sum + toEUR(d.amount, d.currency), 0))}</p></div>
             </div>
 
-            <div style={{ ...styles.chartCard, marginBottom: 24 }}>
-              <h3 style={{ ...styles.chartTitle, marginBottom: 16 }}>Monthly Projection</h3>
-              <div style={{ height: 256 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={monthlyDividendProjection}><XAxis dataKey="month" axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 11 }} /><YAxis axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={(v) => `€${v.toFixed(0)}`} /><Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #374151', borderRadius: 12 }} formatter={(value) => [formatCurrency(value), 'Dividends']} /><Bar dataKey="amount" fill="#10b981" radius={[6, 6, 0, 0]} /></BarChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-
-            <div style={styles.chartCard}>
-              <h3 style={{ ...styles.chartTitle, marginBottom: 16 }}>Upcoming Payments</h3>
-              {dividendCalendar.length > 0 ? dividendCalendar.map((div, index) => (
-                <div key={index} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 16, borderRadius: 12, backgroundColor: '#111827', border: '1px solid #1e293b', marginBottom: 12 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-                    <div style={{ width: 64, height: 64, borderRadius: 12, background: 'linear-gradient(135deg, rgba(52,211,153,0.2), rgba(16,185,129,0.1))', border: '1px solid rgba(52,211,153,0.3)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}><span style={{ fontSize: 12, color: '#34d399' }}>{new Date(div.nextDate).toLocaleDateString('en-GB', { month: 'short' })}</span><span style={{ fontSize: 20, fontWeight: 700, color: '#34d399' }}>{new Date(div.nextDate).getDate()}</span></div>
-                    <div><p style={{ fontWeight: 500, color: '#ffffff', margin: 0 }}>{div.symbol}</p><p style={{ fontSize: 14, color: '#6b7280', margin: '2px 0' }}>{div.name}</p><p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>{div.frequency}</p></div>
-                  </div>
-                  <div style={{ textAlign: 'right' }}><p style={{ fontWeight: 500, color: '#34d399', margin: 0 }}>{formatCurrency(div.expectedAmountEUR)}</p><p style={{ fontSize: 14, color: '#6b7280', margin: '2px 0' }}>{formatCurrency(div.amountPerShare, div.currency)} per share</p></div>
+            {/* Dividends by Year Chart */}
+            {receivedDividends.length > 0 && (
+              <div style={{ ...styles.chartCard, marginBottom: 24 }}>
+                <h3 style={{ ...styles.chartTitle, marginBottom: 16 }}>Dividends by Year</h3>
+                <div style={{ height: 256 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={(() => {
+                      const byYear = {};
+                      receivedDividends.forEach(d => {
+                        const year = new Date(d.date).getFullYear();
+                        byYear[year] = (byYear[year] || 0) + toEUR(d.amount, d.currency);
+                      });
+                      return Object.entries(byYear).map(([year, amount]) => ({ year, amount })).sort((a, b) => a.year - b.year);
+                    })()}><XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 11 }} /><YAxis axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={(v) => `€${v.toFixed(0)}`} /><Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #374151', borderRadius: 12 }} formatter={(value) => [formatCurrency(value), 'Dividends']} /><Bar dataKey="amount" fill="#10b981" radius={[6, 6, 0, 0]} /></BarChart>
+                  </ResponsiveContainer>
                 </div>
-              )) : <p style={{ color: '#6b7280', textAlign: 'center', padding: 32 }}>No upcoming payments</p>}
+              </div>
+            )}
+
+            {/* Dividend History */}
+            <div style={styles.chartCard}>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 16 }}>Dividend History</h3>
+              {receivedDividends.length > 0 ? [...receivedDividends].sort((a, b) => new Date(b.date) - new Date(a.date)).map((div, index) => (
+                <div key={div.id || index} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 16, borderRadius: 12, backgroundColor: '#111827', border: '1px solid #1e293b', marginBottom: 12 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+                    <div style={{ width: 64, height: 64, borderRadius: 12, background: 'linear-gradient(135deg, rgba(52,211,153,0.2), rgba(16,185,129,0.1))', border: '1px solid rgba(52,211,153,0.3)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+                      <span style={{ fontSize: 12, color: '#34d399' }}>{new Date(div.date).toLocaleDateString('en-GB', { month: 'short' })}</span>
+                      <span style={{ fontSize: 20, fontWeight: 700, color: '#34d399' }}>{new Date(div.date).getDate()}</span>
+                    </div>
+                    <div>
+                      <p style={{ fontWeight: 500, color: '#ffffff', margin: 0 }}>{div.symbol}</p>
+                      <p style={{ fontSize: 14, color: '#6b7280', margin: '2px 0' }}>{new Date(div.date).getFullYear()}</p>
+                    </div>
+                  </div>
+                  <div style={{ textAlign: 'right' }}>
+                    <p style={{ fontWeight: 500, color: '#34d399', margin: 0 }}>{formatCurrency(toEUR(div.amount, div.currency))}</p>
+                    <p style={{ fontSize: 14, color: '#6b7280', margin: '2px 0' }}>{formatCurrency(div.amount, div.currency)}</p>
+                  </div>
+                </div>
+              )) : <p style={{ color: '#6b7280', textAlign: 'center', padding: 32 }}>No dividend payments recorded</p>}
             </div>
           </div>
         )}
@@ -1967,7 +2020,7 @@ AAPL,Apple Inc.,Stock,100,150.00,USD` : `date,symbol,type,shares,price,fee
 
       {showSettingsModal && (
         <div style={styles.modal}>
-          <div style={styles.modalContent}>
+          <div style={{ ...styles.modalContent, maxWidth: 600, maxHeight: '90vh', overflowY: 'auto' }}>
             <h3 style={styles.modalTitle}>⚙️ Settings</h3>
             <div style={{ marginBottom: 24 }}>
               <h4 style={{ fontSize: 14, fontWeight: 600, color: '#ffffff', marginBottom: 12 }}>☁️ Supabase Connection</h4>
@@ -1989,20 +2042,51 @@ AAPL,Apple Inc.,Stock,100,150.00,USD` : `date,symbol,type,shares,price,fee
                 <p style={{ fontSize: 12, color: '#818cf8', margin: 0 }}>💡 Find URL & Key in Supabase Dashboard → Settings → API</p>
               </div>
             </div>
-            <div style={{ marginBottom: 24, padding: 16, borderRadius: 12, backgroundColor: '#111827', border: '1px solid #1e293b' }}>
-              <h4 style={{ fontSize: 14, fontWeight: 600, color: '#ffffff', marginBottom: 8 }}>Your Table Structure</h4>
-              <p style={{ fontSize: 11, color: '#6b7280', marginBottom: 8 }}>Based on your screenshot, your columns are:</p>
-              <code style={{ display: 'block', fontSize: 10, fontFamily: 'monospace', backgroundColor: '#0a0d14', padding: 12, borderRadius: 8, color: '#34d399', whiteSpace: 'pre-wrap' }}>{`symbol, quantity, price_per_unit, asset_type, 
-transaction_type, transaction_date, currency, user_id`}</code>
-            </div>
             {syncStatus.message && (
               <div style={{ padding: 12, borderRadius: 8, backgroundColor: syncStatus.status === 'error' ? 'rgba(248,113,113,0.1)' : 'rgba(52,211,153,0.1)', border: `1px solid ${syncStatus.status === 'error' ? 'rgba(248,113,113,0.3)' : 'rgba(52,211,153,0.3)'}`, marginBottom: 16 }}>
                 <p style={{ fontSize: 12, color: syncStatus.status === 'error' ? '#f87171' : '#34d399', margin: 0 }}>{syncStatus.message}</p>
               </div>
             )}
-            {dataSource === 'supabase' && rawTransactions.length > 0 && !syncStatus.message && (
-              <div style={{ padding: 12, borderRadius: 8, backgroundColor: 'rgba(52,211,153,0.1)', border: '1px solid rgba(52,211,153,0.2)', marginBottom: 16 }}>
-                <p style={{ fontSize: 12, color: '#34d399', margin: 0 }}>✅ Connected! {rawTransactions.length} transactions loaded, {positions.length} positions</p>
+            {dataSource === 'supabase' && rawTransactions.length > 0 && (
+              <div style={{ marginBottom: 24, padding: 16, borderRadius: 12, backgroundColor: '#111827', border: '1px solid #1e293b' }}>
+                <h4 style={{ fontSize: 14, fontWeight: 600, color: '#34d399', marginBottom: 12 }}>✅ Connected to Supabase</h4>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, fontSize: 12 }}>
+                  <div><span style={{ color: '#6b7280' }}>Transactions:</span> <span style={{ color: '#fff' }}>{rawTransactions.length}</span></div>
+                  <div><span style={{ color: '#6b7280' }}>Positions:</span> <span style={{ color: '#fff' }}>{positions.length}</span></div>
+                  <div><span style={{ color: '#6b7280' }}>Trades:</span> <span style={{ color: '#fff' }}>{trades.length}</span></div>
+                  <div><span style={{ color: '#6b7280' }}>Fees:</span> <span style={{ color: '#fff' }}>{fees.length}</span></div>
+                  <div><span style={{ color: '#6b7280' }}>Dividends:</span> <span style={{ color: '#fff' }}>{receivedDividends.length}</span></div>
+                </div>
+              </div>
+            )}
+            {/* Position Debug Info */}
+            {positions.length > 0 && (
+              <div style={{ marginBottom: 24 }}>
+                <h4 style={{ fontSize: 14, fontWeight: 600, color: '#ffffff', marginBottom: 12 }}>📊 Position Calculations</h4>
+                <div style={{ maxHeight: 200, overflowY: 'auto', backgroundColor: '#0a0d14', borderRadius: 8, padding: 12 }}>
+                  <table style={{ width: '100%', fontSize: 10, fontFamily: 'monospace' }}>
+                    <thead>
+                      <tr style={{ color: '#6b7280' }}>
+                        <th style={{ textAlign: 'left', padding: 4 }}>Symbol</th>
+                        <th style={{ textAlign: 'right', padding: 4 }}>Shares</th>
+                        <th style={{ textAlign: 'right', padding: 4 }}>Avg Price</th>
+                        <th style={{ textAlign: 'right', padding: 4 }}>Total Cost</th>
+                        <th style={{ textAlign: 'left', padding: 4 }}>Ccy</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {positions.map(p => (
+                        <tr key={p.symbol} style={{ color: '#d1d5db' }}>
+                          <td style={{ padding: 4 }}>{p.symbol}</td>
+                          <td style={{ textAlign: 'right', padding: 4 }}>{p.shares.toFixed(4)}</td>
+                          <td style={{ textAlign: 'right', padding: 4 }}>{p.avgPrice.toFixed(2)}</td>
+                          <td style={{ textAlign: 'right', padding: 4 }}>{(p.shares * p.avgPrice).toFixed(2)}</td>
+                          <td style={{ padding: 4 }}>{p.currency}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             )}
             <div style={styles.modalButtons}>
