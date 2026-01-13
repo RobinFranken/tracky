@@ -58,6 +58,7 @@ const SupabaseService = {
     const trades = [];
     const fees = [];
     const dividends = [];
+    const cashFlows = []; // Track all cash movements
     const stats = { cash: 0, fees: 0, taxes: 0, dividends: 0, buys: 0, sells: 0, skipped: 0 };
     
     const sorted = [...rawTransactions].sort((a, b) => new Date(a.transaction_date) - new Date(b.transaction_date));
@@ -71,16 +72,35 @@ const SupabaseService = {
       const ccy = (tx.currency || 'EUR').toUpperCase();
       const date = tx.transaction_date;
       
-      if (symbol.toLowerCase() === 'cash' || assetType === 'cash') { stats.cash++; return; }
+      // Track cash deposits/withdrawals
+      if (symbol.toLowerCase() === 'cash' || assetType === 'cash') {
+        const amount = qty !== 0 ? qty : price;
+        if (Math.abs(amount) > 0.001) {
+          cashFlows.push({
+            id: `cash-${idx}`,
+            type: amount > 0 ? 'deposit' : 'withdrawal',
+            amount: Math.abs(amount),
+            currency: ccy,
+            date,
+            description: txType || (amount > 0 ? 'Deposit' : 'Withdrawal')
+          });
+        }
+        stats.cash++;
+        return;
+      }
       
       if (symbol.toLowerCase() === 'fee' || assetType === 'expense') {
-        fees.push({ id: `fee-${idx}`, type: 'Transaction Fee', amount: Math.abs(price), currency: ccy, date });
+        const feeAmt = Math.abs(price);
+        fees.push({ id: `fee-${idx}`, type: 'Transaction Fee', amount: feeAmt, currency: ccy, date });
+        cashFlows.push({ id: `cashfee-${idx}`, type: 'fee', amount: feeAmt, currency: ccy, date, description: 'Transaction Fee' });
         stats.fees++;
         return;
       }
       
       if (assetType === 'tax' || txType === 'withholding tax') {
-        fees.push({ id: `tax-${idx}`, type: 'Withholding Tax', amount: Math.abs(price), currency: ccy, date, symbol });
+        const taxAmt = Math.abs(price);
+        fees.push({ id: `tax-${idx}`, type: 'Withholding Tax', amount: taxAmt, currency: ccy, date, symbol });
+        cashFlows.push({ id: `cashtax-${idx}`, type: 'tax', amount: taxAmt, currency: ccy, date, description: `Tax - ${symbol}` });
         stats.taxes++;
         return;
       }
@@ -88,7 +108,10 @@ const SupabaseService = {
       if (assetType === 'cash dividends' || assetType === 'dividend' || txType === 'cash dividends' || txType === 'dividend') {
         const cleanSym = symbol.split(':')[0];
         const amt = Math.abs(qty) < 0.0001 ? Math.abs(price) : Math.abs(price * qty);
-        if (amt > 0.001) dividends.push({ id: `div-${idx}`, symbol: cleanSym, fullSymbol: symbol, amount: amt, currency: ccy, date });
+        if (amt > 0.001) {
+          dividends.push({ id: `div-${idx}`, symbol: cleanSym, fullSymbol: symbol, amount: amt, currency: ccy, date });
+          cashFlows.push({ id: `cashdiv-${idx}`, type: 'dividend', amount: amt, currency: ccy, date, description: `Dividend - ${cleanSym}` });
+        }
         stats.dividends++;
         return;
       }
@@ -107,8 +130,19 @@ const SupabaseService = {
         
         const absQty = Math.abs(qty);
         const tradeType = isBuy ? 'buy' : 'sell';
+        const tradeValue = absQty * price;
         
         trades.push({ id: `trade-${idx}`, symbol: cleanSym, fullSymbol: symbol, type: tradeType, shares: absQty, price, date, currency: ccy, exchange, _rawQty: qty, _rawTxType: tx.transaction_type });
+        
+        // Track cash flow for trades
+        cashFlows.push({
+          id: `cashtrade-${idx}`,
+          type: isBuy ? 'buy' : 'sell',
+          amount: tradeValue,
+          currency: ccy,
+          date,
+          description: `${isBuy ? 'Buy' : 'Sell'} ${cleanSym}`
+        });
         
         if (!positionsMap[cleanSym]) {
           positionsMap[cleanSym] = { symbol: cleanSym, fullSymbol: symbol, type: assetType === 'etf' ? 'ETF' : 'Stock', shares: 0, totalCost: 0, avgPrice: 0, currency: ccy, exchange, firstBuyDate: null };
@@ -136,7 +170,7 @@ const SupabaseService = {
       .filter(p => p.shares > 0.00001)
       .map((p, i) => ({ id: i + 1, symbol: p.symbol, fullSymbol: p.fullSymbol, name: p.symbol, type: p.type, shares: p.shares, avgPrice: p.avgPrice, currentPrice: p.avgPrice, currency: p.currency, exchange: p.exchange, purchaseDate: p.firstBuyDate }));
     
-    return { positions: openPositions, trades, fees, dividends, allPositions: positionsMap, stats };
+    return { positions: openPositions, trades, fees, dividends, cashFlows, allPositions: positionsMap, stats };
   }
 };
 
@@ -438,6 +472,7 @@ export default function PortfolioDashboard() {
   const [trades, setTrades] = useState([]);
   const [fees, setFees] = useState([]);
   const [dividends, setDividends] = useState([]);
+  const [cashFlows, setCashFlows] = useState([]);
   const [rawTx, setRawTx] = useState([]);
   const [stats, setStats] = useState(null);
   
@@ -530,6 +565,7 @@ export default function PortfolioDashboard() {
             setTrades(p.trades);
             setFees(p.fees);
             setDividends(p.dividends);
+            setCashFlows(p.cashFlows || []);
             setStats(p.stats);
             setSource('supabase');
             setLastUpdate(new Date());
@@ -558,6 +594,7 @@ export default function PortfolioDashboard() {
         setTrades(p.trades);
         setFees(p.fees);
         setDividends(p.dividends);
+        setCashFlows(p.cashFlows || []);
         setStats(p.stats);
         setSource('supabase');
         setLastUpdate(new Date());
@@ -590,36 +627,70 @@ export default function PortfolioDashboard() {
     }
     
     const { symbol, quantity, price, date, currency, asset_type } = addTxForm;
-    if (!symbol || !date) {
-      alert('Please fill in all required fields');
+    if (!date) {
+      alert('Please fill in the date');
       return;
     }
     
-    // For dividends and fees, quantity field holds the amount
+    // Determine what type of transaction this is
+    const isCashTx = addTxType === 'deposit' || addTxType === 'withdrawal';
     const isDivOrFee = addTxType === 'dividend' || addTxType === 'fee';
-    if (!isDivOrFee && (!quantity || !price)) {
-      alert('Please fill in quantity and price');
+    const isTrade = addTxType === 'buy' || addTxType === 'sell';
+    
+    // Validate required fields
+    if (isTrade && (!symbol || !quantity || !price)) {
+      alert('Please fill in symbol, quantity and price');
       return;
     }
-    if (isDivOrFee && !quantity) {
+    if ((isDivOrFee || isCashTx) && !quantity) {
       alert('Please fill in the amount');
       return;
     }
+    if (isDivOrFee && !symbol) {
+      alert('Please fill in the symbol');
+      return;
+    }
     
-    const tx = {
-      symbol: addTxType === 'fee' ? 'Fee' : symbol.toUpperCase(),
-      quantity: isDivOrFee ? 0 : (addTxType === 'sell' ? -Math.abs(parseFloat(quantity)) : Math.abs(parseFloat(quantity))),
-      price_per_unit: isDivOrFee ? parseFloat(quantity) : parseFloat(price),
-      transaction_date: date,
-      currency: currency.toUpperCase(),
-      asset_type: addTxType === 'dividend' ? 'cash dividends' : addTxType === 'fee' ? 'expense' : asset_type,
-      transaction_type: addTxType === 'dividend' ? 'cash dividends' : addTxType
-    };
+    let tx;
+    if (isCashTx) {
+      // Cash deposit or withdrawal
+      tx = {
+        symbol: 'Cash',
+        quantity: addTxType === 'withdrawal' ? -Math.abs(parseFloat(quantity)) : Math.abs(parseFloat(quantity)),
+        price_per_unit: 0,
+        transaction_date: date,
+        currency: currency.toUpperCase(),
+        asset_type: 'cash',
+        transaction_type: addTxType
+      };
+    } else if (isDivOrFee) {
+      // Dividend or fee
+      tx = {
+        symbol: addTxType === 'fee' ? 'Fee' : symbol.toUpperCase(),
+        quantity: 0,
+        price_per_unit: parseFloat(quantity),
+        transaction_date: date,
+        currency: currency.toUpperCase(),
+        asset_type: addTxType === 'dividend' ? 'cash dividends' : 'expense',
+        transaction_type: addTxType === 'dividend' ? 'cash dividends' : addTxType
+      };
+    } else {
+      // Buy or sell
+      tx = {
+        symbol: symbol.toUpperCase(),
+        quantity: addTxType === 'sell' ? -Math.abs(parseFloat(quantity)) : Math.abs(parseFloat(quantity)),
+        price_per_unit: parseFloat(price),
+        transaction_date: date,
+        currency: currency.toUpperCase(),
+        asset_type: asset_type,
+        transaction_type: addTxType
+      };
+    }
     
     try {
       setStatus({ state: 'loading', msg: `Adding ${addTxType}...` });
       await SupabaseService.insertTransaction(tx);
-      setStatus({ state: 'success', msg: `✓ Added ${addTxType} for ${symbol}` });
+      setStatus({ state: 'success', msg: `✓ Added ${addTxType}${symbol ? ` for ${symbol}` : ''}` });
       setShowAddTx(false);
       setAddTxForm({ symbol: '', quantity: '', price: '', date: new Date().toISOString().split('T')[0], currency: 'EUR', asset_type: 'stock' });
       // Refresh data
@@ -633,6 +704,21 @@ export default function PortfolioDashboard() {
   // Metrics
   const totalFees = useMemo(() => fees.reduce((s, f) => s + toEUR(f.amount, f.currency), 0), [fees]);
   const totalDivs = useMemo(() => dividends.reduce((s, d) => s + toEUR(d.amount, d.currency), 0), [dividends]);
+  
+  // Cash metrics
+  const cashMetrics = useMemo(() => {
+    const deposits = cashFlows.filter(c => c.type === 'deposit').reduce((s, c) => s + toEUR(c.amount, c.currency), 0);
+    const withdrawals = cashFlows.filter(c => c.type === 'withdrawal').reduce((s, c) => s + toEUR(c.amount, c.currency), 0);
+    const buysTotal = cashFlows.filter(c => c.type === 'buy').reduce((s, c) => s + toEUR(c.amount, c.currency), 0);
+    const sellsTotal = cashFlows.filter(c => c.type === 'sell').reduce((s, c) => s + toEUR(c.amount, c.currency), 0);
+    const divsTotal = cashFlows.filter(c => c.type === 'dividend').reduce((s, c) => s + toEUR(c.amount, c.currency), 0);
+    const feesTotal = cashFlows.filter(c => c.type === 'fee' || c.type === 'tax').reduce((s, c) => s + toEUR(c.amount, c.currency), 0);
+    
+    // Cash balance = deposits - withdrawals - buys + sells + dividends - fees
+    const balance = deposits - withdrawals - buysTotal + sellsTotal + divsTotal - feesTotal;
+    
+    return { deposits, withdrawals, buysTotal, sellsTotal, divsTotal, feesTotal, balance };
+  }, [cashFlows]);
   
   const metrics = useMemo(() => {
     let val = 0, cost = 0;
@@ -1000,6 +1086,42 @@ export default function PortfolioDashboard() {
                 </div>
               ))}
             </div>
+
+            {/* Cash Position */}
+            {cashMetrics.deposits > 0 && (
+              <div style={{ ...styles.chartCard, marginTop: 24 }}>
+                <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>💰 Cash Position</h3>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 16, marginBottom: 20 }}>
+                  <div style={{ padding: 16, borderRadius: 12, backgroundColor: '#0a0d14' }}>
+                    <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Total Deposited</p>
+                    <p style={{ color: '#34d399', fontSize: 20, fontWeight: 700, margin: '4px 0 0' }}>{fmt(cashMetrics.deposits)}</p>
+                  </div>
+                  <div style={{ padding: 16, borderRadius: 12, backgroundColor: '#0a0d14' }}>
+                    <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Spent on Buys</p>
+                    <p style={{ color: '#f87171', fontSize: 20, fontWeight: 700, margin: '4px 0 0' }}>{fmt(cashMetrics.buysTotal)}</p>
+                  </div>
+                  <div style={{ padding: 16, borderRadius: 12, backgroundColor: '#0a0d14' }}>
+                    <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Received from Sales</p>
+                    <p style={{ color: '#34d399', fontSize: 20, fontWeight: 700, margin: '4px 0 0' }}>{fmt(cashMetrics.sellsTotal)}</p>
+                  </div>
+                  <div style={{ padding: 16, borderRadius: 12, backgroundColor: '#0a0d14' }}>
+                    <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Dividends</p>
+                    <p style={{ color: '#34d399', fontSize: 20, fontWeight: 700, margin: '4px 0 0' }}>{fmt(cashMetrics.divsTotal)}</p>
+                  </div>
+                  <div style={{ padding: 16, borderRadius: 12, backgroundColor: '#0a0d14' }}>
+                    <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Fees & Tax</p>
+                    <p style={{ color: '#f87171', fontSize: 20, fontWeight: 700, margin: '4px 0 0' }}>{fmt(cashMetrics.feesTotal)}</p>
+                  </div>
+                  <div style={{ padding: 16, borderRadius: 12, backgroundColor: cashMetrics.balance >= 0 ? 'rgba(52,211,153,0.15)' : 'rgba(248,113,113,0.15)', border: `1px solid ${cashMetrics.balance >= 0 ? 'rgba(52,211,153,0.3)' : 'rgba(248,113,113,0.3)'}` }}>
+                    <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Cash Balance</p>
+                    <p style={{ color: cashMetrics.balance >= 0 ? '#34d399' : '#f87171', fontSize: 20, fontWeight: 700, margin: '4px 0 0' }}>{fmt(cashMetrics.balance)}</p>
+                  </div>
+                </div>
+                <p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>
+                  💡 Cash Balance = Deposits - Withdrawals - Buys + Sells + Dividends - Fees
+                </p>
+              </div>
+            )}
           </div>
         )}
 
@@ -1397,14 +1519,14 @@ export default function PortfolioDashboard() {
             <h3 style={{ fontSize: 22, fontWeight: 700, marginBottom: 24 }}>➕ Add Transaction</h3>
             
             {/* Transaction Type Selector */}
-            <div style={{ display: 'flex', gap: 8, marginBottom: 24 }}>
-              {['buy', 'sell', 'dividend', 'fee'].map(type => (
+            <div style={{ display: 'flex', gap: 8, marginBottom: 24, flexWrap: 'wrap' }}>
+              {['buy', 'sell', 'dividend', 'fee', 'deposit', 'withdrawal'].map(type => (
                 <button 
                   key={type} 
                   onClick={() => setAddTxType(type)}
                   style={{ 
-                    flex: 1, padding: '12px 16px', borderRadius: 10, border: 'none', cursor: 'pointer', fontWeight: 600, fontSize: 13, textTransform: 'capitalize',
-                    backgroundColor: addTxType === type ? (type === 'buy' ? '#34d399' : type === 'sell' ? '#f87171' : type === 'dividend' ? '#6366f1' : '#fbbf24') : '#1e293b',
+                    flex: '1 1 auto', minWidth: 80, padding: '12px 16px', borderRadius: 10, border: 'none', cursor: 'pointer', fontWeight: 600, fontSize: 13, textTransform: 'capitalize',
+                    backgroundColor: addTxType === type ? (type === 'buy' || type === 'deposit' ? '#34d399' : type === 'sell' || type === 'withdrawal' ? '#f87171' : type === 'dividend' ? '#6366f1' : '#fbbf24') : '#1e293b',
                     color: addTxType === type ? '#fff' : '#9ca3af'
                   }}
                 >
@@ -1414,16 +1536,18 @@ export default function PortfolioDashboard() {
             </div>
             
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-              <div>
-                <label style={styles.inputLabel}>{addTxType === 'fee' ? 'Description' : 'Symbol'} *</label>
-                <input 
-                  type="text" 
-                  value={addTxForm.symbol} 
-                  onChange={e => setAddTxForm({...addTxForm, symbol: e.target.value})}
-                  style={styles.input} 
-                  placeholder={addTxType === 'fee' ? 'e.g., Transaction Fee' : 'e.g., AAPL'} 
-                />
-              </div>
+              {addTxType !== 'deposit' && addTxType !== 'withdrawal' && (
+                <div>
+                  <label style={styles.inputLabel}>{addTxType === 'fee' ? 'Description' : 'Symbol'} *</label>
+                  <input 
+                    type="text" 
+                    value={addTxForm.symbol} 
+                    onChange={e => setAddTxForm({...addTxForm, symbol: e.target.value})}
+                    style={styles.input} 
+                    placeholder={addTxType === 'fee' ? 'e.g., Transaction Fee' : 'e.g., AAPL'} 
+                  />
+                </div>
+              )}
               <div>
                 <label style={styles.inputLabel}>Date *</label>
                 <input 
@@ -1434,19 +1558,31 @@ export default function PortfolioDashboard() {
                 />
               </div>
               <div>
-                <label style={styles.inputLabel}>{addTxType === 'dividend' || addTxType === 'fee' ? 'Amount' : 'Quantity'} *</label>
+                <label style={styles.inputLabel}>{addTxType === 'buy' || addTxType === 'sell' ? 'Quantity' : 'Amount'} *</label>
                 <input 
                   type="number" 
                   step="any"
                   value={addTxForm.quantity} 
                   onChange={e => setAddTxForm({...addTxForm, quantity: e.target.value})}
                   style={styles.input} 
-                  placeholder={addTxType === 'dividend' || addTxType === 'fee' ? '0.00' : '0'} 
+                  placeholder={addTxType === 'buy' || addTxType === 'sell' ? '10' : '100.00'} 
                 />
               </div>
-              <div>
-                <label style={styles.inputLabel}>{addTxType === 'dividend' || addTxType === 'fee' ? 'Currency' : 'Price per Share'} *</label>
-                {addTxType === 'dividend' || addTxType === 'fee' ? (
+              {(addTxType === 'buy' || addTxType === 'sell') ? (
+                <div>
+                  <label style={styles.inputLabel}>Price per Share *</label>
+                  <input 
+                    type="number" 
+                    step="any"
+                    value={addTxForm.price} 
+                    onChange={e => setAddTxForm({...addTxForm, price: e.target.value})}
+                    style={styles.input} 
+                    placeholder="0.00" 
+                  />
+                </div>
+              ) : (
+                <div>
+                  <label style={styles.inputLabel}>Currency</label>
                   <select 
                     value={addTxForm.currency} 
                     onChange={e => setAddTxForm({...addTxForm, currency: e.target.value})}
@@ -1456,17 +1592,8 @@ export default function PortfolioDashboard() {
                     <option value="USD">USD</option>
                     <option value="GBP">GBP</option>
                   </select>
-                ) : (
-                  <input 
-                    type="number" 
-                    step="any"
-                    value={addTxForm.price} 
-                    onChange={e => setAddTxForm({...addTxForm, price: e.target.value})}
-                    style={styles.input} 
-                    placeholder="0.00" 
-                  />
-                )}
-              </div>
+                </div>
+              )}
               {(addTxType === 'buy' || addTxType === 'sell') && (
                 <>
                   <div>
