@@ -41,6 +41,18 @@ const SupabaseService = {
     return await response.json();
   },
 
+  async insertTransaction(transaction) {
+    if (!this.isConfigured) throw new Error('Not configured');
+    const url = `${this.client.url}/rest/v1/${this.tableName}`;
+    const response = await fetch(url, { 
+      method: 'POST', 
+      headers: { ...this.client.headers, 'Prefer': 'return=representation' },
+      body: JSON.stringify(transaction)
+    });
+    if (!response.ok) throw new Error(`Supabase ${response.status}: ${await response.text()}`);
+    return await response.json();
+  },
+
   processTransactions(rawTransactions) {
     const positionsMap = {};
     const trades = [];
@@ -439,6 +451,9 @@ export default function PortfolioDashboard() {
   const [status, setStatus] = useState({ state: 'idle', msg: '' });
   
   const [showSettings, setShowSettings] = useState(false);
+  const [showAddTx, setShowAddTx] = useState(false);
+  const [addTxType, setAddTxType] = useState('buy');
+  const [addTxForm, setAddTxForm] = useState({ symbol: '', quantity: '', price: '', date: new Date().toISOString().split('T')[0], currency: 'EUR', asset_type: 'stock' });
   const [sbUrl, setSbUrl] = useState(loadStorage('sb_url', ''));
   const [sbKey, setSbKey] = useState(loadStorage('sb_key', ''));
   const [sbTable, setSbTable] = useState(loadStorage('sb_table', 'transactions'));
@@ -565,6 +580,54 @@ export default function PortfolioDashboard() {
     PriceService.init(finnhubKey);
     if (sbUrl && sbKey) { SupabaseService.init(sbUrl, sbKey, sbTable); sync(); }
     setShowSettings(false);
+  };
+
+  // Add transaction to Supabase
+  const addTransaction = async () => {
+    if (!SupabaseService.isConfigured) {
+      alert('Please configure Supabase connection first');
+      return;
+    }
+    
+    const { symbol, quantity, price, date, currency, asset_type } = addTxForm;
+    if (!symbol || !date) {
+      alert('Please fill in all required fields');
+      return;
+    }
+    
+    // For dividends and fees, quantity field holds the amount
+    const isDivOrFee = addTxType === 'dividend' || addTxType === 'fee';
+    if (!isDivOrFee && (!quantity || !price)) {
+      alert('Please fill in quantity and price');
+      return;
+    }
+    if (isDivOrFee && !quantity) {
+      alert('Please fill in the amount');
+      return;
+    }
+    
+    const tx = {
+      symbol: addTxType === 'fee' ? 'Fee' : symbol.toUpperCase(),
+      quantity: isDivOrFee ? 0 : (addTxType === 'sell' ? -Math.abs(parseFloat(quantity)) : Math.abs(parseFloat(quantity))),
+      price_per_unit: isDivOrFee ? parseFloat(quantity) : parseFloat(price),
+      transaction_date: date,
+      currency: currency.toUpperCase(),
+      asset_type: addTxType === 'dividend' ? 'cash dividends' : addTxType === 'fee' ? 'expense' : asset_type,
+      transaction_type: addTxType === 'dividend' ? 'cash dividends' : addTxType
+    };
+    
+    try {
+      setStatus({ state: 'loading', msg: `Adding ${addTxType}...` });
+      await SupabaseService.insertTransaction(tx);
+      setStatus({ state: 'success', msg: `✓ Added ${addTxType} for ${symbol}` });
+      setShowAddTx(false);
+      setAddTxForm({ symbol: '', quantity: '', price: '', date: new Date().toISOString().split('T')[0], currency: 'EUR', asset_type: 'stock' });
+      // Refresh data
+      sync();
+    } catch (e) {
+      setStatus({ state: 'error', msg: `Failed to add: ${e.message}` });
+    }
+    setTimeout(() => setStatus({ state: 'idle', msg: '' }), 5000);
   };
 
   // Metrics
@@ -709,14 +772,14 @@ export default function PortfolioDashboard() {
     })).reverse();
   }, [yearlyPerformance, availableYears]);
 
-  // Dividends by year
+  // Dividends by year (sorted old to new for chart)
   const dividendsByYear = useMemo(() => {
     const byYear = {};
     dividends.forEach(d => {
       const year = new Date(d.date).getFullYear();
       byYear[year] = (byYear[year] || 0) + toEUR(d.amount, d.currency);
     });
-    return Object.entries(byYear).map(([y, v]) => ({ year: y, amount: v })).sort((a, b) => b.year - a.year);
+    return Object.entries(byYear).map(([y, v]) => ({ year: y, amount: v })).sort((a, b) => a.year - b.year);
   }, [dividends]);
 
   // Period metrics
@@ -735,9 +798,9 @@ export default function PortfolioDashboard() {
     badge: { fontSize: 11, padding: '4px 12px', borderRadius: 20, fontWeight: 600 },
     btn: { padding: '10px 16px', borderRadius: 12, border: '1px solid #374151', cursor: 'pointer', fontWeight: 500, fontSize: 14, backgroundColor: '#111827', color: '#d1d5db', transition: 'all 0.2s' },
     btnPrimary: { padding: '10px 20px', borderRadius: 12, border: 'none', cursor: 'pointer', fontWeight: 600, fontSize: 14, background: 'linear-gradient(135deg, #6366f1, #a855f7)', color: '#fff', boxShadow: '0 4px 12px rgba(99,102,241,0.3)' },
-    tabs: { display: 'flex', gap: 8, padding: '16px 24px', borderBottom: '1px solid #1e293b', backgroundColor: '#0a0d14', overflowX: 'auto' },
-    tab: { padding: '12px 24px', borderRadius: 12, border: 'none', cursor: 'pointer', fontWeight: 500, fontSize: 14, backgroundColor: 'transparent', color: '#6b7280', transition: 'all 0.2s' },
-    tabActive: { backgroundColor: '#1e293b', color: '#fff' },
+    tabs: { display: 'flex', gap: 8, padding: '16px 24px', borderBottom: '1px solid #1e293b', backgroundColor: '#0f172a', overflowX: 'auto' },
+    tab: { padding: '12px 24px', borderRadius: 12, border: '1px solid transparent', cursor: 'pointer', fontWeight: 600, fontSize: 14, backgroundColor: '#1e293b', color: '#9ca3af', transition: 'all 0.2s' },
+    tabActive: { backgroundColor: '#6366f1', color: '#fff', border: '1px solid #6366f1', boxShadow: '0 4px 12px rgba(99,102,241,0.3)' },
     main: { padding: 24, maxWidth: 1600, margin: '0 auto' },
     grid4: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16 },
     card: { padding: 24, borderRadius: 20, backgroundColor: '#111827', border: '1px solid #1e293b', transition: 'all 0.2s' },
@@ -787,11 +850,12 @@ export default function PortfolioDashboard() {
               📊 Fetching prices... {priceProgress.current}/{priceProgress.total}
             </span>
           )}
+          <button style={styles.btnPrimary} onClick={() => setShowAddTx(true)}>+ Add</button>
           <button style={styles.btn} onClick={() => fetchPrices(positions)} disabled={priceProgress.loading || !positions.length}>
-            💹 Update Prices
+            💹 Prices
           </button>
           <button style={styles.btn} onClick={sync} disabled={status.state === 'loading'}>
-            {status.state === 'loading' ? '⏳ Syncing...' : '🔄 Refresh'}
+            {status.state === 'loading' ? '⏳' : '🔄'}
           </button>
           <button style={styles.btn} onClick={() => setShowSettings(true)}>⚙️</button>
         </div>
@@ -982,34 +1046,18 @@ export default function PortfolioDashboard() {
         {/* PERFORMANCE TAB */}
         {activeTab === 'performance' && (
           <div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24, marginBottom: 24 }}>
-              <div style={styles.chartCard}>
-                <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>Yearly Activity</h3>
-                <div style={{ height: 280 }}>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={yearlyChartData}>
-                      <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 12 }} />
-                      <YAxis axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={v => `€${(v/1000).toFixed(0)}k`} />
-                      <Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #374151', borderRadius: 12 }} formatter={v => fmt(v)} />
-                      <Bar dataKey="invested" fill="#6366f1" radius={[4, 4, 0, 0]} name="Invested" />
-                      <Bar dataKey="proceeds" fill="#34d399" radius={[4, 4, 0, 0]} name="Proceeds" />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              </div>
-
-              <div style={styles.chartCard}>
-                <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>Dividends by Year</h3>
-                <div style={{ height: 280 }}>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={dividendsByYear}>
-                      <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 12 }} />
-                      <YAxis axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={v => `€${v.toFixed(0)}`} />
-                      <Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #374151', borderRadius: 12 }} formatter={v => fmt(v)} />
-                      <Bar dataKey="amount" fill="#10b981" radius={[4, 4, 0, 0]} name="Dividends" />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
+            <div style={{ ...styles.chartCard, marginBottom: 24 }}>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>Yearly Activity</h3>
+              <div style={{ height: 300 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={yearlyChartData}>
+                    <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 12 }} />
+                    <YAxis axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={v => `€${(v/1000).toFixed(0)}k`} />
+                    <Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #374151', borderRadius: 12 }} formatter={v => fmt(v)} />
+                    <Bar dataKey="invested" fill="#6366f1" radius={[4, 4, 0, 0]} name="Invested" />
+                    <Bar dataKey="proceeds" fill="#34d399" radius={[4, 4, 0, 0]} name="Proceeds" />
+                  </BarChart>
+                </ResponsiveContainer>
               </div>
             </div>
 
@@ -1150,6 +1198,21 @@ export default function PortfolioDashboard() {
               <div style={styles.card}>
                 <p style={styles.cardLabel}>Avg per Payment</p>
                 <p style={styles.cardValue}>{fmt(dividends.length > 0 ? totalDivs / dividends.length : 0)}</p>
+              </div>
+            </div>
+
+            {/* Dividends by Year Chart */}
+            <div style={{ ...styles.chartCard, marginBottom: 24 }}>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>Dividends by Year</h3>
+              <div style={{ height: 280 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={dividendsByYear}>
+                    <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 12 }} />
+                    <YAxis axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={v => `€${v.toFixed(0)}`} />
+                    <Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #374151', borderRadius: 12 }} formatter={v => fmt(v)} />
+                    <Bar dataKey="amount" fill="#10b981" radius={[4, 4, 0, 0]} name="Dividends" />
+                  </BarChart>
+                </ResponsiveContainer>
               </div>
             </div>
 
@@ -1322,6 +1385,132 @@ export default function PortfolioDashboard() {
                   <span style={{ color: '#d1d5db', fontSize: 14 }}>{t.shares.toFixed(4)} @ {fmt(t.price, t.currency)}</span>
                 </div>
               ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Add Transaction Modal */}
+      {showAddTx && (
+        <div style={styles.modal} onClick={() => setShowAddTx(false)}>
+          <div style={styles.modalContent} onClick={e => e.stopPropagation()}>
+            <h3 style={{ fontSize: 22, fontWeight: 700, marginBottom: 24 }}>➕ Add Transaction</h3>
+            
+            {/* Transaction Type Selector */}
+            <div style={{ display: 'flex', gap: 8, marginBottom: 24 }}>
+              {['buy', 'sell', 'dividend', 'fee'].map(type => (
+                <button 
+                  key={type} 
+                  onClick={() => setAddTxType(type)}
+                  style={{ 
+                    flex: 1, padding: '12px 16px', borderRadius: 10, border: 'none', cursor: 'pointer', fontWeight: 600, fontSize: 13, textTransform: 'capitalize',
+                    backgroundColor: addTxType === type ? (type === 'buy' ? '#34d399' : type === 'sell' ? '#f87171' : type === 'dividend' ? '#6366f1' : '#fbbf24') : '#1e293b',
+                    color: addTxType === type ? '#fff' : '#9ca3af'
+                  }}
+                >
+                  {type}
+                </button>
+              ))}
+            </div>
+            
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+              <div>
+                <label style={styles.inputLabel}>{addTxType === 'fee' ? 'Description' : 'Symbol'} *</label>
+                <input 
+                  type="text" 
+                  value={addTxForm.symbol} 
+                  onChange={e => setAddTxForm({...addTxForm, symbol: e.target.value})}
+                  style={styles.input} 
+                  placeholder={addTxType === 'fee' ? 'e.g., Transaction Fee' : 'e.g., AAPL'} 
+                />
+              </div>
+              <div>
+                <label style={styles.inputLabel}>Date *</label>
+                <input 
+                  type="date" 
+                  value={addTxForm.date} 
+                  onChange={e => setAddTxForm({...addTxForm, date: e.target.value})}
+                  style={styles.input} 
+                />
+              </div>
+              <div>
+                <label style={styles.inputLabel}>{addTxType === 'dividend' || addTxType === 'fee' ? 'Amount' : 'Quantity'} *</label>
+                <input 
+                  type="number" 
+                  step="any"
+                  value={addTxForm.quantity} 
+                  onChange={e => setAddTxForm({...addTxForm, quantity: e.target.value})}
+                  style={styles.input} 
+                  placeholder={addTxType === 'dividend' || addTxType === 'fee' ? '0.00' : '0'} 
+                />
+              </div>
+              <div>
+                <label style={styles.inputLabel}>{addTxType === 'dividend' || addTxType === 'fee' ? 'Currency' : 'Price per Share'} *</label>
+                {addTxType === 'dividend' || addTxType === 'fee' ? (
+                  <select 
+                    value={addTxForm.currency} 
+                    onChange={e => setAddTxForm({...addTxForm, currency: e.target.value})}
+                    style={styles.input}
+                  >
+                    <option value="EUR">EUR</option>
+                    <option value="USD">USD</option>
+                    <option value="GBP">GBP</option>
+                  </select>
+                ) : (
+                  <input 
+                    type="number" 
+                    step="any"
+                    value={addTxForm.price} 
+                    onChange={e => setAddTxForm({...addTxForm, price: e.target.value})}
+                    style={styles.input} 
+                    placeholder="0.00" 
+                  />
+                )}
+              </div>
+              {(addTxType === 'buy' || addTxType === 'sell') && (
+                <>
+                  <div>
+                    <label style={styles.inputLabel}>Currency</label>
+                    <select 
+                      value={addTxForm.currency} 
+                      onChange={e => setAddTxForm({...addTxForm, currency: e.target.value})}
+                      style={styles.input}
+                    >
+                      <option value="EUR">EUR</option>
+                      <option value="USD">USD</option>
+                      <option value="GBP">GBP</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label style={styles.inputLabel}>Asset Type</label>
+                    <select 
+                      value={addTxForm.asset_type} 
+                      onChange={e => setAddTxForm({...addTxForm, asset_type: e.target.value})}
+                      style={styles.input}
+                    >
+                      <option value="stock">Stock</option>
+                      <option value="etf">ETF</option>
+                      <option value="crypto">Crypto</option>
+                    </select>
+                  </div>
+                </>
+              )}
+            </div>
+            
+            {(addTxType === 'buy' || addTxType === 'sell') && addTxForm.quantity && addTxForm.price && (
+              <div style={{ padding: 16, borderRadius: 12, backgroundColor: '#0a0d14', marginTop: 16 }}>
+                <p style={{ color: '#6b7280', fontSize: 13, margin: 0 }}>Total Value</p>
+                <p style={{ color: '#fff', fontSize: 24, fontWeight: 700, margin: '4px 0 0' }}>
+                  {fmt(Math.abs(parseFloat(addTxForm.quantity) * parseFloat(addTxForm.price)), addTxForm.currency)}
+                </p>
+              </div>
+            )}
+            
+            <div style={{ display: 'flex', gap: 12, marginTop: 24 }}>
+              <button onClick={() => setShowAddTx(false)} style={{ ...styles.btn, flex: 1 }}>Cancel</button>
+              <button onClick={addTransaction} style={{ ...styles.btnPrimary, flex: 1 }}>
+                Add {addTxType.charAt(0).toUpperCase() + addTxType.slice(1)}
+              </button>
             </div>
           </div>
         </div>
