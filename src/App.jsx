@@ -344,8 +344,9 @@ const APIService = {
       'ETH': { price: 3284.50, change: -45.20, changePercent: -1.36, currency: 'USD' },
       '4COP': { price: 42.85, change: 0.65, changePercent: 1.54, currency: 'EUR' }
     };
+    // Return null for unknown symbols so avgPrice is kept
     return symbols.reduce((acc, symbol) => {
-      acc[symbol] = mockPrices[symbol] || { price: 100, change: 0, changePercent: 0, currency: 'USD' };
+      acc[symbol] = mockPrices[symbol] || null;
       return acc;
     }, {});
   },
@@ -861,10 +862,22 @@ export default function PortfolioDashboard() {
     const realizedByYear = {};
     const unrealizedByYear = {};
     
-    positions.forEach(position => {
+    // Get unique symbols from trades (including fully sold positions)
+    const allSymbols = new Set([
+      ...positions.map(p => p.symbol),
+      ...trades.map(t => t.symbol)
+    ]);
+    
+    allSymbols.forEach(symbol => {
+      const position = positions.find(p => p.symbol === symbol);
       const positionTrades = trades
-        .filter(t => t.positionId === position.id)
+        .filter(t => t.symbol === symbol)
         .sort((a, b) => new Date(a.date) - new Date(b.date)); // Sort chronologically for FIFO
+      
+      if (positionTrades.length === 0) return;
+      
+      // Get currency from first trade or position
+      const currency = position?.currency || positionTrades[0]?.currency || 'EUR';
       
       // Build tax lots from buys
       const taxLots = [];
@@ -912,14 +925,14 @@ export default function PortfolioDashboard() {
           
           const realizedGainPreFees = saleProceeds - costBasisForSale;
           const realizedGainAfterFees = realizedGainPreFees - saleFee;
-          const realizedGainEUR = toEUR(realizedGainAfterFees, position.currency);
-          const realizedGainPreFeesEUR = toEUR(realizedGainPreFees, position.currency);
+          const realizedGainEUR = toEUR(realizedGainAfterFees, currency);
+          const realizedGainPreFeesEUR = toEUR(realizedGainPreFees, currency);
           
           positionRealizedGain += realizedGainEUR;
           positionRealizedGainPreFees += realizedGainPreFeesEUR;
-          positionRealizedFees += toEUR(saleFee, position.currency);
-          positionCostBasisSold += toEUR(costBasisForSale, position.currency);
-          positionProceeds += toEUR(saleProceeds, position.currency);
+          positionRealizedFees += toEUR(saleFee, currency);
+          positionCostBasisSold += toEUR(costBasisForSale, currency);
+          positionProceeds += toEUR(saleProceeds, currency);
           
           // Track by year
           const saleYear = new Date(trade.date).getFullYear();
@@ -932,11 +945,11 @@ export default function PortfolioDashboard() {
             shares: trade.shares,
             sellPrice: trade.price,
             proceeds: saleProceeds,
-            proceedsEUR: toEUR(saleProceeds, position.currency),
+            proceedsEUR: toEUR(saleProceeds, currency),
             costBasis: costBasisForSale,
-            costBasisEUR: toEUR(costBasisForSale, position.currency),
+            costBasisEUR: toEUR(costBasisForSale, currency),
             fee: saleFee,
-            feeEUR: toEUR(saleFee, position.currency),
+            feeEUR: toEUR(saleFee, currency),
             realizedGain: realizedGainAfterFees,
             realizedGainEUR: realizedGainEUR,
             realizedGainPreFees: realizedGainPreFees,
@@ -954,6 +967,7 @@ export default function PortfolioDashboard() {
       let remainingShares = 0;
       let remainingCostBasis = 0;
       const remainingLots = [];
+      const currentPrice = position?.currentPrice || position?.avgPrice || 0;
       
       taxLots.forEach(lot => {
         if (lot.remainingShares > 0) {
@@ -966,31 +980,35 @@ export default function PortfolioDashboard() {
             originalShares: lot.shares,
             costBasisPerShare: lot.costBasisPerShare,
             costBasis: lot.remainingShares * lot.costBasisPerShare,
-            costBasisEUR: toEUR(lot.remainingShares * lot.costBasisPerShare, position.currency),
-            currentValue: lot.remainingShares * position.currentPrice,
-            currentValueEUR: toEUR(lot.remainingShares * position.currentPrice, position.currency),
-            unrealizedGain: (lot.remainingShares * position.currentPrice) - (lot.remainingShares * lot.costBasisPerShare),
-            unrealizedGainEUR: toEUR((lot.remainingShares * position.currentPrice) - (lot.remainingShares * lot.costBasisPerShare), position.currency),
+            costBasisEUR: toEUR(lot.remainingShares * lot.costBasisPerShare, currency),
+            currentValue: lot.remainingShares * currentPrice,
+            currentValueEUR: toEUR(lot.remainingShares * currentPrice, currency),
+            unrealizedGain: (lot.remainingShares * currentPrice) - (lot.remainingShares * lot.costBasisPerShare),
+            unrealizedGainEUR: toEUR((lot.remainingShares * currentPrice) - (lot.remainingShares * lot.costBasisPerShare), currency),
             holdingDays: Math.ceil((new Date() - new Date(lot.date)) / (1000 * 60 * 60 * 24)),
             isLongTerm: (new Date() - new Date(lot.date)) > (365 * 24 * 60 * 60 * 1000)
           });
         }
       });
       
-      const currentValue = remainingShares * position.currentPrice;
-      const positionUnrealizedGain = toEUR(currentValue - remainingCostBasis, position.currency);
+      const currentValue = remainingShares * currentPrice;
+      const positionUnrealizedGain = toEUR(currentValue - remainingCostBasis, currency);
       const unrealizedReturnPct = remainingCostBasis > 0 ? ((currentValue - remainingCostBasis) / remainingCostBasis) * 100 : 0;
       
-      // Add position-specific fees to the calculation
-      const positionSpecificFees = fees.filter(f => f.positionId === position.id).reduce((sum, f) => sum + toEUR(f.amount, f.currency), 0);
+      // Position-specific fees (not used for now since we track by symbol)
+      const positionSpecificFees = 0;
+      
+      const positionType = position?.type || (positionTrades[0]?.fullSymbol?.includes('Etf') ? 'ETF' : 'Stock');
+      const fullySold = remainingShares < 0.0001;
       
       positionGains.push({
-        id: position.id,
-        symbol: position.symbol,
-        name: position.name,
-        type: position.type,
-        currency: position.currency,
-        currentPrice: position.currentPrice,
+        id: position?.id || symbol,
+        symbol: symbol,
+        name: position?.name || symbol,
+        type: positionType,
+        currency: currency,
+        currentPrice: currentPrice,
+        fullySold,
         // Realized
         realizedGain: positionRealizedGain,
         realizedGainPreFees: positionRealizedGainPreFees,
@@ -1003,8 +1021,8 @@ export default function PortfolioDashboard() {
         unrealizedGain: positionUnrealizedGain,
         unrealizedReturnPct,
         remainingShares,
-        remainingCostBasis: toEUR(remainingCostBasis, position.currency),
-        currentValue: toEUR(currentValue, position.currency),
+        remainingCostBasis: toEUR(remainingCostBasis, currency),
+        currentValue: toEUR(currentValue, currency),
         remainingLots,
         // Combined
         totalGain: positionRealizedGain + positionUnrealizedGain,
