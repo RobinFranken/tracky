@@ -136,10 +136,11 @@ const PriceService = {
   cache: {},
   cacheTime: 5 * 60 * 1000, // 5 min cache
   finnhubKey: '',
+  errors: [],
   
   init(finnhubKey = '') {
     this.finnhubKey = finnhubKey;
-    // Load cache from localStorage
+    this.errors = [];
     try {
       const cached = JSON.parse(localStorage.getItem('price_cache') || '{}');
       this.cache = cached;
@@ -156,70 +157,107 @@ const PriceService = {
   },
   
   // Map exchange suffixes to Yahoo Finance format
-  mapSymbol(symbol, exchange) {
-    const exMap = { 'XAMS': '.AS', 'XETR': '.DE', 'XLON': '.L', 'XPAR': '.PA', 'XNAS': '', 'XNYS': '', 'NYSE': '', 'NASDAQ': '' };
+  getYahooSymbol(symbol, exchange) {
+    const exMap = { 
+      'XAMS': '.AS', 'XETR': '.DE', 'XLON': '.L', 'XPAR': '.PA', 
+      'XNAS': '', 'XNYS': '', 'NYSE': '', 'NASDAQ': '',
+      'AS': '.AS', 'DE': '.DE', 'L': '.L', 'PA': '.PA'
+    };
     const suffix = exMap[exchange?.toUpperCase()] || '';
     return symbol + suffix;
   },
   
-  // Yahoo Finance (works for most stocks via chart API)
+  // Yahoo Finance via CORS proxy
   async fetchYahoo(symbol, exchange) {
-    const ySymbol = this.mapSymbol(symbol, exchange);
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ySymbol}?interval=1d&range=5d`;
+    const ySymbol = this.getYahooSymbol(symbol, exchange);
+    // Use corsproxy.io which is reliable and free
+    const targetUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${ySymbol}?interval=1d&range=5d`;
+    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
+    
     try {
-      const res = await fetch(url);
-      if (!res.ok) return null;
+      console.log(`[Yahoo] Fetching ${ySymbol}...`);
+      const res = await fetch(proxyUrl, { 
+        headers: { 'Accept': 'application/json' }
+      });
+      
+      if (!res.ok) {
+        console.log(`[Yahoo] ${ySymbol} HTTP ${res.status}`);
+        return null;
+      }
+      
       const data = await res.json();
       const quote = data.chart?.result?.[0]?.meta;
-      if (quote?.regularMarketPrice) {
+      
+      if (quote?.regularMarketPrice && quote.regularMarketPrice > 0) {
+        const price = quote.regularMarketPrice;
+        const prevClose = quote.previousClose || quote.chartPreviousClose || price;
+        console.log(`[Yahoo] ${ySymbol} = ${price} ${quote.currency}`);
         return {
-          price: quote.regularMarketPrice,
-          prevClose: quote.previousClose || quote.chartPreviousClose,
-          change: quote.regularMarketPrice - (quote.previousClose || quote.chartPreviousClose || quote.regularMarketPrice),
-          changePct: quote.previousClose ? ((quote.regularMarketPrice - quote.previousClose) / quote.previousClose) * 100 : 0,
+          price,
+          prevClose,
+          change: price - prevClose,
+          changePct: prevClose > 0 ? ((price - prevClose) / prevClose) * 100 : 0,
           currency: quote.currency || 'USD',
           source: 'yahoo'
         };
       }
-    } catch (e) { console.log('Yahoo error:', symbol, e.message); }
+      console.log(`[Yahoo] ${ySymbol} no price data`);
+    } catch (e) { 
+      console.log(`[Yahoo] ${ySymbol} error:`, e.message);
+      this.errors.push({ symbol, source: 'yahoo', error: e.message });
+    }
     return null;
   },
   
-  // Finnhub (US stocks)
+  // Finnhub (US stocks) - no proxy needed, supports CORS
   async fetchFinnhub(symbol) {
     if (!this.finnhubKey) return null;
     try {
+      console.log(`[Finnhub] Fetching ${symbol}...`);
       const url = `https://finnhub.io/api/v1/quote?symbol=${symbol}&token=${this.finnhubKey}`;
       const res = await fetch(url);
-      if (!res.ok) return null;
+      if (!res.ok) {
+        console.log(`[Finnhub] ${symbol} HTTP ${res.status}`);
+        return null;
+      }
       const data = await res.json();
       if (data.c && data.c > 0) {
+        console.log(`[Finnhub] ${symbol} = ${data.c}`);
         return {
           price: data.c,
           prevClose: data.pc,
-          change: data.d,
-          changePct: data.dp,
-          high: data.h,
-          low: data.l,
-          open: data.o,
+          change: data.d || 0,
+          changePct: data.dp || 0,
+          currency: 'USD',
           source: 'finnhub'
         };
       }
-    } catch (e) { console.log('Finnhub error:', symbol, e.message); }
+      console.log(`[Finnhub] ${symbol} no data (c=${data.c})`);
+    } catch (e) { 
+      console.log(`[Finnhub] ${symbol} error:`, e.message);
+      this.errors.push({ symbol, source: 'finnhub', error: e.message });
+    }
     return null;
   },
   
-  // CoinGecko (crypto)
+  // CoinGecko (crypto) - supports CORS
   async fetchCoinGecko(symbol) {
-    const cryptoMap = { 'BTC': 'bitcoin', 'ETH': 'ethereum', 'SOL': 'solana', 'ADA': 'cardano', 'DOT': 'polkadot', 'DOGE': 'dogecoin', 'XRP': 'ripple', 'LINK': 'chainlink', 'AVAX': 'avalanche-2', 'MATIC': 'matic-network' };
+    const cryptoMap = { 
+      'BTC': 'bitcoin', 'ETH': 'ethereum', 'SOL': 'solana', 'ADA': 'cardano', 
+      'DOT': 'polkadot', 'DOGE': 'dogecoin', 'XRP': 'ripple', 'LINK': 'chainlink', 
+      'AVAX': 'avalanche-2', 'MATIC': 'matic-network', 'SHIB': 'shiba-inu'
+    };
     const id = cryptoMap[symbol.toUpperCase()];
     if (!id) return null;
+    
     try {
+      console.log(`[CoinGecko] Fetching ${symbol}...`);
       const url = `https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=eur,usd&include_24hr_change=true`;
       const res = await fetch(url);
       if (!res.ok) return null;
       const data = await res.json();
       if (data[id]) {
+        console.log(`[CoinGecko] ${symbol} = €${data[id].eur}`);
         return {
           price: data[id].eur,
           priceUSD: data[id].usd,
@@ -228,14 +266,17 @@ const PriceService = {
           source: 'coingecko'
         };
       }
-    } catch (e) { console.log('CoinGecko error:', symbol, e.message); }
+    } catch (e) { 
+      console.log(`[CoinGecko] ${symbol} error:`, e.message);
+    }
     return null;
   },
   
-  // Main fetch function with fallback
+  // Main fetch function with fallback chain
   async getPrice(symbol, exchange, type) {
     // Check cache first
     if (this.isCached(symbol)) {
+      console.log(`[Cache] ${symbol} = ${this.cache[symbol].data.price}`);
       return this.cache[symbol].data;
     }
     
@@ -246,17 +287,17 @@ const PriceService = {
       result = await this.fetchCoinGecko(symbol);
     }
     
-    // Try Yahoo (works for most international stocks)
+    // Try Finnhub first for US stocks (if key available)
+    if (!result && this.finnhubKey && (!exchange || ['XNAS', 'XNYS', 'NYSE', 'NASDAQ', ''].includes(exchange?.toUpperCase()))) {
+      result = await this.fetchFinnhub(symbol);
+    }
+    
+    // Try Yahoo Finance as fallback
     if (!result) {
       result = await this.fetchYahoo(symbol, exchange);
     }
     
-    // Try Finnhub for US stocks
-    if (!result && this.finnhubKey) {
-      result = await this.fetchFinnhub(symbol);
-    }
-    
-    // Cache the result
+    // Cache successful results
     if (result) {
       this.cache[symbol] = { data: result, time: Date.now() };
       this.saveCache();
@@ -266,24 +307,35 @@ const PriceService = {
   },
   
   // Batch fetch all positions
-  async fetchAllPrices(positions, onProgress) {
+  async fetchAllPrices(positions, onProgress, onUpdate) {
     const results = {};
     let completed = 0;
+    this.errors = [];
+    
+    console.log(`[PriceService] Fetching prices for ${positions.length} positions...`);
     
     for (const pos of positions) {
       try {
         const price = await this.getPrice(pos.symbol, pos.exchange, pos.type);
         if (price) {
           results[pos.symbol] = price;
+          // Call onUpdate to update UI incrementally
+          if (onUpdate) onUpdate(pos.symbol, price);
         }
         completed++;
         if (onProgress) onProgress(completed, positions.length);
         
         // Small delay to avoid rate limits
-        await new Promise(r => setTimeout(r, 100));
+        await new Promise(r => setTimeout(r, 200));
       } catch (e) {
-        console.error('Price fetch error:', pos.symbol, e);
+        console.error(`[PriceService] Error fetching ${pos.symbol}:`, e);
+        this.errors.push({ symbol: pos.symbol, error: e.message });
       }
+    }
+    
+    console.log(`[PriceService] Done. Got ${Object.keys(results).length}/${positions.length} prices`);
+    if (this.errors.length > 0) {
+      console.log(`[PriceService] Errors:`, this.errors);
     }
     
     return results;
@@ -372,34 +424,49 @@ export default function PortfolioDashboard() {
     if (!positionsToUpdate?.length) return;
     
     setPriceProgress({ loading: true, current: 0, total: positionsToUpdate.length });
+    setStatus({ state: 'loading', msg: 'Fetching live prices...' });
+    
+    let successCount = 0;
     
     try {
-      const prices = await PriceService.fetchAllPrices(positionsToUpdate, (current, total) => {
-        setPriceProgress({ loading: true, current, total });
-      });
+      // Callback to update each position as price comes in
+      const onUpdate = (symbol, priceData) => {
+        successCount++;
+        setPositions(prev => prev.map(p => {
+          if (p.symbol === symbol) {
+            return {
+              ...p,
+              currentPrice: priceData.price,
+              priceChange: priceData.change || 0,
+              priceChangePct: priceData.changePct || 0,
+              priceCurrency: priceData.currency || p.currency,
+              priceSource: priceData.source
+            };
+          }
+          return p;
+        }));
+      };
       
-      // Update positions with live prices
-      setPositions(prev => prev.map(p => {
-        const livePrice = prices[p.symbol];
-        if (livePrice) {
-          return {
-            ...p,
-            currentPrice: livePrice.price,
-            priceChange: livePrice.change || 0,
-            priceChangePct: livePrice.changePct || 0,
-            priceCurrency: livePrice.currency || p.currency,
-            priceSource: livePrice.source
-          };
-        }
-        return p;
-      }));
+      await PriceService.fetchAllPrices(
+        positionsToUpdate, 
+        (current, total) => setPriceProgress({ loading: true, current, total }),
+        onUpdate
+      );
       
       setLastPriceUpdate(new Date());
+      
+      if (successCount > 0) {
+        setStatus({ state: 'success', msg: `✓ Updated ${successCount}/${positionsToUpdate.length} prices` });
+      } else {
+        setStatus({ state: 'error', msg: `Could not fetch prices. Check console for details.` });
+      }
     } catch (e) {
       console.error('Price fetch error:', e);
+      setStatus({ state: 'error', msg: `Price fetch failed: ${e.message}` });
     }
     
     setPriceProgress({ loading: false, current: 0, total: 0 });
+    setTimeout(() => setStatus({ state: 'idle', msg: '' }), 5000);
   };
 
   // Load data
@@ -1248,9 +1315,19 @@ export default function PortfolioDashboard() {
               <h4 style={{ color: '#fff', margin: '0 0 16px', fontSize: 16 }}>💹 Live Prices</h4>
               <label style={styles.inputLabel}>Finnhub API Key (optional, for US stocks)</label>
               <input type="password" value={finnhubKey} onChange={e => setFinnhubKey(e.target.value)} style={{...styles.input, marginBottom: 8}} placeholder="Enter your Finnhub API key..." />
-              <p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>
-                Get a free key at <a href="https://finnhub.io" target="_blank" rel="noopener noreferrer" style={{ color: '#6366f1' }}>finnhub.io</a> • Yahoo Finance is used as fallback for all stocks
+              <p style={{ fontSize: 12, color: '#6b7280', margin: '0 0 12px' }}>
+                Get a free key at <a href="https://finnhub.io" target="_blank" rel="noopener noreferrer" style={{ color: '#6366f1' }}>finnhub.io</a> • Yahoo Finance is used for all stocks via CORS proxy
               </p>
+              <button 
+                onClick={() => { 
+                  localStorage.removeItem('price_cache'); 
+                  PriceService.cache = {}; 
+                  alert('Price cache cleared! Click "Update Prices" to fetch fresh data.'); 
+                }} 
+                style={{ ...styles.btn, padding: '8px 14px', fontSize: 12 }}
+              >
+                🗑️ Clear Price Cache
+              </button>
             </div>
             
             {source === 'supabase' && (
