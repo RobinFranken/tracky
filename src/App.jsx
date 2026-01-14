@@ -20,6 +20,9 @@ const TIMEFRAMES = [
 // SUPABASE SERVICE
 // ======================
 
+// Known crypto symbols
+const CRYPTO_SYMBOLS = ['BTC', 'ETH', 'SOL', 'ADA', 'DOT', 'DOGE', 'XRP', 'LINK', 'AVAX', 'MATIC', 'SHIB', 'LTC', 'UNI', 'ATOM', 'XLM', 'ALGO', 'FTM', 'NEAR', 'APT', 'ARB'];
+
 const SupabaseService = {
   client: null,
   isConfigured: false,
@@ -111,7 +114,8 @@ const SupabaseService = {
         trades.push({ id: `trade-${idx}`, symbol: cleanSym, fullSymbol: symbol, type: tradeType, shares: absQty, price, date, currency: ccy, exchange, _rawQty: qty, _rawTxType: tx.transaction_type });
         
         if (!positionsMap[cleanSym]) {
-          positionsMap[cleanSym] = { symbol: cleanSym, fullSymbol: symbol, type: assetType === 'etf' ? 'ETF' : 'Stock', shares: 0, totalCost: 0, avgPrice: 0, currency: ccy, exchange, firstBuyDate: null };
+          const isCrypto = CRYPTO_SYMBOLS.includes(cleanSym.toUpperCase()) || assetType === 'crypto' || assetType === 'cryptocurrency';
+          positionsMap[cleanSym] = { symbol: cleanSym, fullSymbol: symbol, type: isCrypto ? 'Crypto' : (assetType === 'etf' ? 'ETF' : 'Stock'), shares: 0, totalCost: 0, avgPrice: 0, currency: ccy, exchange, firstBuyDate: null };
         }
         
         const pos = positionsMap[cleanSym];
@@ -328,8 +332,11 @@ const PriceService = {
     
     let result = null;
     
-    // Try crypto first if it looks like crypto
-    if (type?.toLowerCase() === 'crypto') {
+    // Check if this is a crypto symbol
+    const isCrypto = type?.toLowerCase() === 'crypto' || CRYPTO_SYMBOLS.includes(symbol.toUpperCase());
+    
+    // Try CoinGecko first for crypto
+    if (isCrypto) {
       result = await this.fetchCoinGecko(symbol);
     }
     
@@ -338,8 +345,8 @@ const PriceService = {
       result = await this.fetchFinnhub(symbol);
     }
     
-    // Try Yahoo Finance as fallback
-    if (!result) {
+    // Try Yahoo Finance as fallback (but not for crypto)
+    if (!result && !isCrypto) {
       result = await this.fetchYahoo(symbol, exchange);
     }
     
@@ -406,7 +413,7 @@ const fmtPct = (v) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`;
 const fmtDate = d => d ? new Date(d).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : 'N/A';
 
 // Generate yearly performance from trades
-const generateYearlyPerformance = (trades, positions) => {
+const generateYearlyPerformance = (trades, positions, dividends) => {
   const years = {};
   const tradesByYear = {};
   
@@ -416,20 +423,33 @@ const generateYearlyPerformance = (trades, positions) => {
     tradesByYear[year].push(t);
   });
   
-  Object.keys(tradesByYear).forEach(year => {
-    const yearTrades = tradesByYear[year];
+  // Get all years from trades
+  const allYears = [...new Set(trades.map(t => new Date(t.date).getFullYear()))].sort();
+  
+  allYears.forEach(year => {
+    const yearTrades = tradesByYear[year] || [];
     const buys = yearTrades.filter(t => t.type === 'buy');
     const sells = yearTrades.filter(t => t.type === 'sell');
     const invested = buys.reduce((s, t) => s + toEUR(t.shares * t.price, t.currency), 0);
     const proceeds = sells.reduce((s, t) => s + toEUR(t.shares * t.price, t.currency), 0);
     
+    // Dividends for this year
+    const yearDivs = dividends.filter(d => new Date(d.date).getFullYear() === year);
+    const totalDividends = yearDivs.reduce((s, d) => s + toEUR(d.amount, d.currency), 0);
+    
+    // Net flow = proceeds + dividends - invested
+    const netFlow = proceeds + totalDividends - invested;
+    
     years[year] = {
-      year: parseInt(year),
+      year,
       invested,
       proceeds,
+      netFlow,
       trades: yearTrades.length,
       buys: buys.length,
-      sells: sells.length
+      sells: sells.length,
+      dividends: totalDividends,
+      dividendPayments: yearDivs.length
     };
   });
   
@@ -785,8 +805,18 @@ export default function PortfolioDashboard() {
   }, [positions, selectedTimeframe]);
 
   // Yearly performance
-  const yearlyPerformance = useMemo(() => generateYearlyPerformance(trades, positions), [trades, positions]);
+  const yearlyPerformance = useMemo(() => generateYearlyPerformance(trades, positions, dividends), [trades, positions, dividends]);
   const availableYears = useMemo(() => Object.keys(yearlyPerformance).map(Number).sort((a, b) => b - a), [yearlyPerformance]);
+
+  // Top movers (positions with live prices)
+  const topMovers = useMemo(() => {
+    const withPrices = positions.filter(p => p.priceChangePct !== undefined && p.priceChangePct !== 0);
+    const sorted = [...withPrices].sort((a, b) => b.priceChangePct - a.priceChangePct);
+    return {
+      gainers: sorted.filter(p => p.priceChangePct > 0).slice(0, 5),
+      losers: sorted.filter(p => p.priceChangePct < 0).slice(-5).reverse()
+    };
+  }, [positions]);
 
   // Yearly chart data
   const yearlyChartData = useMemo(() => {
@@ -1072,45 +1102,132 @@ export default function PortfolioDashboard() {
         {/* PERFORMANCE TAB */}
         {activeTab === 'performance' && (
           <div>
-            <div style={{ ...styles.chartCard, marginBottom: 24 }}>
-              <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>Yearly Activity</h3>
-              <div style={{ height: 300 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={yearlyChartData}>
-                    <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 12 }} />
-                    <YAxis axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={v => `€${(v/1000).toFixed(0)}k`} />
-                    <Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #374151', borderRadius: 12 }} formatter={v => fmt(v)} />
-                    <Bar dataKey="invested" fill="#6366f1" radius={[4, 4, 0, 0]} name="Invested" />
-                    <Bar dataKey="proceeds" fill="#34d399" radius={[4, 4, 0, 0]} name="Proceeds" />
-                  </BarChart>
-                </ResponsiveContainer>
+            {/* Top Daily Movers */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24, marginBottom: 24 }}>
+              {/* Top Gainers */}
+              <div style={styles.chartCard}>
+                <h3 style={{ ...styles.chartTitle, marginBottom: 16, color: '#34d399' }}>📈 Top Gainers Today</h3>
+                {topMovers.gainers.length === 0 ? (
+                  <p style={{ color: '#6b7280', textAlign: 'center', padding: 20 }}>No price data yet. Click "💹 Prices" to fetch live data.</p>
+                ) : (
+                  topMovers.gainers.map((p, idx) => (
+                    <div key={p.symbol} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 12, borderRadius: 10, backgroundColor: '#0a0d14', marginBottom: 8 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                        <span style={{ width: 28, height: 28, borderRadius: 8, backgroundColor: 'rgba(52,211,153,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700, color: '#34d399' }}>{idx + 1}</span>
+                        <div>
+                          <p style={{ fontWeight: 600, margin: 0, fontSize: 14 }}>{p.symbol}</p>
+                          <p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>{fmt(p.currentPrice, p.priceCurrency || p.currency)}</p>
+                        </div>
+                      </div>
+                      <span style={{ fontSize: 16, fontWeight: 700, color: '#34d399' }}>▲ {p.priceChangePct.toFixed(2)}%</span>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              {/* Top Losers */}
+              <div style={styles.chartCard}>
+                <h3 style={{ ...styles.chartTitle, marginBottom: 16, color: '#f87171' }}>📉 Top Losers Today</h3>
+                {topMovers.losers.length === 0 ? (
+                  <p style={{ color: '#6b7280', textAlign: 'center', padding: 20 }}>No price data yet. Click "💹 Prices" to fetch live data.</p>
+                ) : (
+                  topMovers.losers.map((p, idx) => (
+                    <div key={p.symbol} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 12, borderRadius: 10, backgroundColor: '#0a0d14', marginBottom: 8 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                        <span style={{ width: 28, height: 28, borderRadius: 8, backgroundColor: 'rgba(248,113,113,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700, color: '#f87171' }}>{idx + 1}</span>
+                        <div>
+                          <p style={{ fontWeight: 600, margin: 0, fontSize: 14 }}>{p.symbol}</p>
+                          <p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>{fmt(p.currentPrice, p.priceCurrency || p.currency)}</p>
+                        </div>
+                      </div>
+                      <span style={{ fontSize: 16, fontWeight: 700, color: '#f87171' }}>▼ {Math.abs(p.priceChangePct).toFixed(2)}%</span>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
 
+            {/* Annual Performance Overview */}
             <div style={styles.chartCard}>
-              <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>Year by Year Summary</h3>
-              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                <thead>
-                  <tr style={{ borderBottom: '1px solid #1e293b' }}>
-                    <th style={{ textAlign: 'left', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Year</th>
-                    <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Invested</th>
-                    <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Proceeds</th>
-                    <th style={{ textAlign: 'center', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Trades</th>
-                    <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Dividends</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {availableYears.map(year => (
-                    <tr key={year} style={{ borderBottom: '1px solid #1e293b' }}>
-                      <td style={{ padding: '14px 8px', fontWeight: 600, color: YEAR_COLORS[year] || '#fff' }}>{year}</td>
-                      <td style={{ padding: '14px 8px', textAlign: 'right', color: '#34d399' }}>{fmt(yearlyPerformance[year]?.invested || 0)}</td>
-                      <td style={{ padding: '14px 8px', textAlign: 'right', color: '#f87171' }}>{fmt(yearlyPerformance[year]?.proceeds || 0)}</td>
-                      <td style={{ padding: '14px 8px', textAlign: 'center', color: '#9ca3af' }}>{yearlyPerformance[year]?.trades || 0}</td>
-                      <td style={{ padding: '14px 8px', textAlign: 'right', color: '#34d399' }}>{fmt(dividendsByYear.find(d => d.year === year.toString())?.amount || 0)}</td>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>📊 Annual Performance Overview</h3>
+              <div style={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid #1e293b' }}>
+                      <th style={{ textAlign: 'left', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Year</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Invested</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Sold</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Net Flow</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Dividends</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Div Yield %</th>
+                      <th style={{ textAlign: 'center', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Trades</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {availableYears.map(year => {
+                      const yp = yearlyPerformance[year] || {};
+                      // Calculate cumulative invested up to this year for dividend yield
+                      const cumulativeInvested = availableYears
+                        .filter(y => y <= year)
+                        .reduce((sum, y) => sum + (yearlyPerformance[y]?.invested || 0) - (yearlyPerformance[y]?.proceeds || 0), 0);
+                      const divYield = cumulativeInvested > 0 ? (yp.dividends / cumulativeInvested) * 100 : 0;
+                      
+                      return (
+                        <tr key={year} style={{ borderBottom: '1px solid #1e293b' }}>
+                          <td style={{ padding: '14px 8px', fontWeight: 600, color: YEAR_COLORS[year] || '#fff' }}>{year}</td>
+                          <td style={{ padding: '14px 8px', textAlign: 'right', color: '#6b7280' }}>{fmt(yp.invested || 0)}</td>
+                          <td style={{ padding: '14px 8px', textAlign: 'right', color: '#6b7280' }}>{fmt(yp.proceeds || 0)}</td>
+                          <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: (yp.netFlow || 0) >= 0 ? '#34d399' : '#f87171' }}>
+                            {(yp.netFlow || 0) >= 0 ? '+' : ''}{fmt(yp.netFlow || 0)}
+                          </td>
+                          <td style={{ padding: '14px 8px', textAlign: 'right', color: '#34d399' }}>{fmt(yp.dividends || 0)}</td>
+                          <td style={{ padding: '14px 8px', textAlign: 'right', color: divYield > 0 ? '#34d399' : '#6b7280' }}>
+                            {divYield > 0 ? `${divYield.toFixed(2)}%` : '—'}
+                          </td>
+                          <td style={{ padding: '14px 8px', textAlign: 'center', color: '#9ca3af' }}>{yp.trades || 0}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                  <tfoot>
+                    <tr style={{ borderTop: '2px solid #374151', backgroundColor: '#0a0d14' }}>
+                      <td style={{ padding: '14px 8px', fontWeight: 700, color: '#fff' }}>TOTAL</td>
+                      <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: '#6b7280' }}>
+                        {fmt(availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.invested || 0), 0))}
+                      </td>
+                      <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: '#6b7280' }}>
+                        {fmt(availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.proceeds || 0), 0))}
+                      </td>
+                      <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 700, color: availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.netFlow || 0), 0) >= 0 ? '#34d399' : '#f87171' }}>
+                        {fmt(availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.netFlow || 0), 0))}
+                      </td>
+                      <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: '#34d399' }}>
+                        {fmt(availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.dividends || 0), 0))}
+                      </td>
+                      <td style={{ padding: '14px 8px', textAlign: 'right', color: '#6b7280' }}>—</td>
+                      <td style={{ padding: '14px 8px', textAlign: 'center', fontWeight: 600, color: '#9ca3af' }}>
+                        {availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.trades || 0), 0)}
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            </div>
+
+            {/* Visual Chart */}
+            <div style={{ ...styles.chartCard, marginTop: 24 }}>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>Net Annual Cash Flow</h3>
+              <div style={{ height: 280 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={availableYears.map(y => ({ year: y.toString(), netFlow: yearlyPerformance[y]?.netFlow || 0, dividends: yearlyPerformance[y]?.dividends || 0 })).reverse()}>
+                    <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 12 }} />
+                    <YAxis axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={v => `€${(v/1000).toFixed(0)}k`} />
+                    <Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #374151', borderRadius: 12 }} formatter={v => fmt(v)} />
+                    <Bar dataKey="netFlow" fill="#6366f1" radius={[4, 4, 0, 0]} name="Net Flow" />
+                    <Bar dataKey="dividends" fill="#34d399" radius={[4, 4, 0, 0]} name="Dividends" />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
             </div>
           </div>
         )}
