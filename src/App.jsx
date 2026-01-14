@@ -16,6 +16,14 @@ const HISTORICAL_PORTFOLIO_VALUES = {
   2024: { value: 21062, note: 'USD $16,908 + EUR €4,830' },
   2025: { value: 26558, note: 'USD $21,643 + EUR €6,646' }
 };
+
+// Robeco ONE Funds - hardcoded positions (update NAVs in Settings)
+const ROBECO_FUNDS = {
+  'ROB-DEF': { name: 'Robeco ONE Defensief', units: 72.5602, isin: 'NL0010220810', defaultNav: 160.59 },
+  'ROB-NEU': { name: 'Robeco ONE Neutraal', units: 45.4299, isin: 'NL0010220802', defaultNav: 208.16 },
+  'ROB-OFF': { name: 'Robeco ONE Offensief', units: 63.5309, isin: 'NL0010220786', defaultNav: 267.88 },
+  'ROB-DUR': { name: 'Robeco ONE Duurzaam', units: 11.6560, isin: 'NL0010220794', defaultNav: 142.87 }
+};
 const TIMEFRAMES = [
   { key: '1W', label: '1W', days: 7 },
   { key: '1M', label: '1M', days: 30 },
@@ -496,6 +504,50 @@ export default function PortfolioDashboard() {
   const [finnhubKey, setFinnhubKey] = useState(loadStorage('finnhub_key', ''));
   const [priceProgress, setPriceProgress] = useState({ loading: false, current: 0, total: 0 });
   const [lastPriceUpdate, setLastPriceUpdate] = useState(null);
+  
+  // Fund NAVs (stored in localStorage, can be updated in Settings)
+  const [fundNavs, setFundNavs] = useState(() => {
+    try {
+      const stored = localStorage.getItem('fund_navs');
+      if (stored) return JSON.parse(stored);
+    } catch {}
+    // Default to the hardcoded NAVs
+    return Object.fromEntries(Object.entries(ROBECO_FUNDS).map(([k, v]) => [k, v.defaultNav]));
+  });
+  
+  // Save fund NAVs to localStorage when they change
+  useEffect(() => {
+    localStorage.setItem('fund_navs', JSON.stringify(fundNavs));
+  }, [fundNavs]);
+  
+  // Build fund positions from hardcoded data
+  const fundPositions = useMemo(() => {
+    return Object.entries(ROBECO_FUNDS).map(([symbol, fund]) => {
+      const nav = fundNavs[symbol] || fund.defaultNav;
+      const value = fund.units * nav;
+      // Estimate cost basis from total return percentages (from Evi app)
+      const returnPcts = { 'ROB-DEF': 38.19, 'ROB-NEU': 66.76, 'ROB-OFF': 117.95, 'ROB-DUR': 14.14 };
+      const returnPct = returnPcts[symbol] || 0;
+      const costBasis = value / (1 + returnPct / 100);
+      const avgPrice = costBasis / fund.units;
+      
+      return {
+        symbol,
+        name: fund.name,
+        shares: fund.units,
+        avgPrice,
+        currentPrice: nav,
+        currency: 'EUR',
+        priceCurrency: 'EUR',
+        asset_type: 'fund',
+        type: 'Fund',
+        isin: fund.isin,
+        priceChangePct: 0, // Funds don't have daily change in our system
+        isFund: true,
+        returnPct
+      };
+    });
+  }, [fundNavs]);
 
   // Initialize price service
   useEffect(() => {
@@ -670,10 +722,33 @@ export default function PortfolioDashboard() {
   const totalFees = useMemo(() => fees.reduce((s, f) => s + toEUR(f.amount, f.currency), 0), [fees]);
   const totalDivs = useMemo(() => dividends.reduce((s, d) => s + toEUR(d.amount, d.currency), 0), [dividends]);
   
+  // Combined positions (stocks/ETFs from database + funds)
+  const allPositions = useMemo(() => [...positions, ...fundPositions], [positions, fundPositions]);
+  
   const metrics = useMemo(() => {
     let val = 0, cost = 0;
-    positions.forEach(p => {
+    allPositions.forEach(p => {
       val += toEUR(p.shares * p.currentPrice, p.currency);
+      cost += toEUR(p.shares * p.avgPrice, p.currency);
+    });
+    return { val, cost, gain: val - cost, pct: cost > 0 ? ((val - cost) / cost) * 100 : 0 };
+  }, [allPositions]);
+  
+  // Fund-only metrics (for display)
+  const fundMetrics = useMemo(() => {
+    let val = 0, cost = 0;
+    fundPositions.forEach(p => {
+      val += p.shares * p.currentPrice;
+      cost += p.shares * p.avgPrice;
+    });
+    return { val, cost, gain: val - cost, pct: cost > 0 ? ((val - cost) / cost) * 100 : 0 };
+  }, [fundPositions]);
+  
+  // Stock-only metrics
+  const stockMetrics = useMemo(() => {
+    let val = 0, cost = 0;
+    positions.forEach(p => {
+      val += toEUR(p.shares * p.currentPrice, p.priceCurrency || p.currency);
       cost += toEUR(p.shares * p.avgPrice, p.currency);
     });
     return { val, cost, gain: val - cost, pct: cost > 0 ? ((val - cost) / cost) * 100 : 0 };
@@ -790,14 +865,18 @@ export default function PortfolioDashboard() {
   // Allocation
   const allocation = useMemo(() => {
     const byType = {};
-    positions.forEach(p => { const v = toEUR(p.shares * p.currentPrice, p.currency); byType[p.type] = (byType[p.type] || 0) + v; });
+    allPositions.forEach(p => { 
+      const v = toEUR(p.shares * p.currentPrice, p.currency); 
+      const type = p.type || p.asset_type || 'Stock';
+      byType[type] = (byType[type] || 0) + v; 
+    });
     const total = Object.values(byType).reduce((s, v) => s + v, 0);
     return Object.entries(byType).map(([t, v]) => ({ name: t, value: v, pct: total > 0 ? (v / total) * 100 : 0 }));
-  }, [positions]);
+  }, [allPositions]);
 
   // Historical data for chart
   const historicalData = useMemo(() => {
-    if (!positions.length) return [];
+    if (!allPositions.length) return [];
     const tf = TIMEFRAMES.find(t => t.key === selectedTimeframe);
     let days = tf?.days || 365;
     if (tf?.key === 'YTD') {
@@ -806,7 +885,7 @@ export default function PortfolioDashboard() {
       days = Math.ceil((now - startOfYear) / 86400000);
     }
     
-    const curVal = positions.reduce((s, p) => s + toEUR(p.shares * p.currentPrice, p.currency), 0);
+    const curVal = allPositions.reduce((s, p) => s + toEUR(p.shares * p.currentPrice, p.currency), 0);
     const data = [];
     for (let i = days; i >= 0; i--) {
       const d = new Date();
@@ -943,14 +1022,16 @@ export default function PortfolioDashboard() {
             {/* Key Metrics */}
             <div style={{ ...styles.grid4, marginBottom: 24 }}>
               <div style={{ ...styles.card, background: 'linear-gradient(135deg, rgba(99,102,241,0.15), rgba(168,85,247,0.1))', borderColor: 'rgba(99,102,241,0.3)' }}>
-                <p style={styles.cardLabel}>Portfolio Value</p>
+                <p style={styles.cardLabel}>Total Portfolio Value</p>
                 <p style={styles.cardValue}>{fmt(metrics.val)}</p>
-                <p style={{ ...styles.cardSub, color: periodMetrics.pct >= 0 ? '#34d399' : '#f87171' }}>{fmtPct(periodMetrics.pct)} this period</p>
+                <p style={{ ...styles.cardSub, color: '#6b7280' }}>
+                  Stocks: {fmt(stockMetrics.val)} • Funds: {fmt(fundMetrics.val)}
+                </p>
               </div>
               <div style={styles.card}>
                 <p style={styles.cardLabel}>Total Gain/Loss</p>
-                <p style={{ ...styles.cardValue, color: (gains.realized + gains.unrealized) >= 0 ? '#34d399' : '#f87171' }}>{fmt(gains.realized + gains.unrealized)}</p>
-                <p style={{ ...styles.cardSub, color: '#6b7280' }}>{fmt(gains.realized)} realized</p>
+                <p style={{ ...styles.cardValue, color: metrics.gain >= 0 ? '#34d399' : '#f87171' }}>{fmt(metrics.gain)}</p>
+                <p style={{ ...styles.cardSub, color: metrics.pct >= 0 ? '#34d399' : '#f87171' }}>{fmtPct(metrics.pct)} overall</p>
               </div>
               <div style={styles.card}>
                 <p style={styles.cardLabel}>Dividends Received</p>
@@ -1035,21 +1116,28 @@ export default function PortfolioDashboard() {
                   <button onClick={() => setActiveTab('holdings')} style={{ ...styles.btn, padding: '8px 14px', fontSize: 12 }}>View All →</button>
                 </div>
               </div>
-              {[...positions].sort((a, b) => toEUR(b.shares * b.currentPrice, b.currency) - toEUR(a.shares * a.currentPrice, a.currency)).slice(0, 5).map((p, idx) => (
+              {[...allPositions].sort((a, b) => toEUR(b.shares * b.currentPrice, b.currency) - toEUR(a.shares * a.currentPrice, a.currency)).slice(0, 10).map((p, idx) => (
                 <div key={p.symbol} onClick={() => setSelectedPosition(p)} style={styles.row} onMouseOver={e => Object.assign(e.currentTarget.style, styles.rowHover)} onMouseOut={e => Object.assign(e.currentTarget.style, { backgroundColor: '#0a0d14', borderColor: 'transparent' })}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-                    <div style={{ width: 44, height: 44, borderRadius: 12, background: `linear-gradient(135deg, ${COLORS[idx % COLORS.length]}40, ${COLORS[idx % COLORS.length]}20)`, border: `1px solid ${COLORS[idx % COLORS.length]}50`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 12, color: COLORS[idx % COLORS.length] }}>{p.symbol.slice(0, 4)}</div>
+                    <div style={{ width: 44, height: 44, borderRadius: 12, background: p.isFund ? 'linear-gradient(135deg, #a78bfa40, #a78bfa20)' : `linear-gradient(135deg, ${COLORS[idx % COLORS.length]}40, ${COLORS[idx % COLORS.length]}20)`, border: `1px solid ${p.isFund ? '#a78bfa50' : COLORS[idx % COLORS.length] + '50'}`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 11, color: p.isFund ? '#a78bfa' : COLORS[idx % COLORS.length] }}>
+                      {p.isFund ? '🏦' : p.symbol.slice(0, 4)}
+                    </div>
                     <div>
                       <p style={{ fontWeight: 600, margin: 0, fontSize: 15 }}>
-                        {p.symbol}
+                        {p.isFund ? p.name.replace('Robeco ONE ', '') : p.symbol}
                         {p.priceSource && <span style={{ fontSize: 10, color: '#6366f1', marginLeft: 8 }}>● LIVE</span>}
+                        {p.isFund && <span style={{ fontSize: 10, color: '#a78bfa', marginLeft: 8 }}>FUND</span>}
                       </p>
-                      <p style={{ fontSize: 13, color: '#6b7280', margin: '2px 0 0' }}>{p.shares.toFixed(2)} @ {fmt(p.currentPrice, p.priceCurrency || p.currency)}</p>
+                      <p style={{ fontSize: 13, color: '#6b7280', margin: '2px 0 0' }}>{p.shares.toFixed(p.isFund ? 4 : 2)} @ {fmt(p.currentPrice, p.priceCurrency || p.currency)}</p>
                     </div>
                   </div>
                   <div style={{ textAlign: 'right' }}>
                     <p style={{ fontWeight: 600, margin: 0, fontSize: 16 }}>{fmt(toEUR(p.shares * p.currentPrice, p.priceCurrency || p.currency))}</p>
-                    {p.priceChangePct !== undefined && p.priceChangePct !== 0 ? (
+                    {p.isFund && p.returnPct !== undefined ? (
+                      <p style={{ fontSize: 13, color: p.returnPct >= 0 ? '#34d399' : '#f87171', margin: '2px 0 0' }}>
+                        {p.returnPct >= 0 ? '+' : ''}{p.returnPct.toFixed(2)}% total
+                      </p>
+                    ) : p.priceChangePct !== undefined && p.priceChangePct !== 0 ? (
                       <p style={{ fontSize: 13, color: p.priceChangePct >= 0 ? '#34d399' : '#f87171', margin: '2px 0 0' }}>
                         {p.priceChangePct >= 0 ? '▲' : '▼'} {Math.abs(p.priceChangePct).toFixed(2)}%
                       </p>
@@ -1067,17 +1155,98 @@ export default function PortfolioDashboard() {
         {activeTab === 'holdings' && (
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-              <h2 style={{ fontSize: 22, fontWeight: 600 }}>Holdings ({positions.length})</h2>
+              <h2 style={{ fontSize: 22, fontWeight: 600 }}>Holdings ({allPositions.length})</h2>
               <button onClick={() => fetchPrices(positions)} disabled={priceProgress.loading} style={styles.btn}>
                 {priceProgress.loading ? `Updating ${priceProgress.current}/${priceProgress.total}...` : '💹 Update Prices'}
               </button>
             </div>
 
+            {/* Portfolio Breakdown */}
+            <div style={{ ...styles.grid4, marginBottom: 24 }}>
+              <div style={{ ...styles.card, background: 'linear-gradient(135deg, rgba(99,102,241,0.15), rgba(168,85,247,0.1))', borderColor: 'rgba(99,102,241,0.3)' }}>
+                <p style={styles.cardLabel}>Stocks & ETFs</p>
+                <p style={styles.cardValue}>{fmt(stockMetrics.val)}</p>
+                <p style={{ ...styles.cardSub, color: stockMetrics.gain >= 0 ? '#34d399' : '#f87171' }}>
+                  {fmt(stockMetrics.gain)} ({fmtPct(stockMetrics.pct)})
+                </p>
+              </div>
+              <div style={{ ...styles.card, background: 'linear-gradient(135deg, rgba(167,139,250,0.15), rgba(139,92,246,0.1))', borderColor: 'rgba(167,139,250,0.3)' }}>
+                <p style={styles.cardLabel}>Robeco Funds</p>
+                <p style={styles.cardValue}>{fmt(fundMetrics.val)}</p>
+                <p style={{ ...styles.cardSub, color: fundMetrics.gain >= 0 ? '#34d399' : '#f87171' }}>
+                  {fmt(fundMetrics.gain)} ({fmtPct(fundMetrics.pct)})
+                </p>
+              </div>
+              <div style={styles.card}>
+                <p style={styles.cardLabel}>Total Value</p>
+                <p style={styles.cardValue}>{fmt(metrics.val)}</p>
+                <p style={{ ...styles.cardSub, color: metrics.gain >= 0 ? '#34d399' : '#f87171' }}>
+                  {fmt(metrics.gain)} total gain
+                </p>
+              </div>
+              <div style={styles.card}>
+                <p style={styles.cardLabel}>Positions</p>
+                <p style={styles.cardValue}>{allPositions.length}</p>
+                <p style={{ ...styles.cardSub, color: '#6b7280' }}>
+                  {positions.length} stocks • {fundPositions.length} funds
+                </p>
+              </div>
+            </div>
+
+            {/* Robeco Funds Section */}
+            <div style={{ ...styles.chartCard, marginBottom: 24 }}>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 16 }}>🏦 Robeco ONE Funds</h3>
+              <div style={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid #1e293b' }}>
+                      <th style={{ textAlign: 'left', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Fund</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Units</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>NAV</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Value</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Return</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {fundPositions.map(p => {
+                      const value = p.shares * p.currentPrice;
+                      return (
+                        <tr key={p.symbol} style={{ borderBottom: '1px solid #1e293b' }}>
+                          <td style={{ padding: '14px 8px' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                              <span style={{ fontWeight: 600 }}>{p.name.replace('Robeco ONE ', '')}</span>
+                            </div>
+                          </td>
+                          <td style={{ padding: '14px 8px', textAlign: 'right', color: '#d1d5db' }}>{p.shares.toFixed(4)}</td>
+                          <td style={{ padding: '14px 8px', textAlign: 'right', color: '#9ca3af' }}>{fmt(p.currentPrice)}</td>
+                          <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: '#fff' }}>{fmt(value)}</td>
+                          <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: p.returnPct >= 0 ? '#34d399' : '#f87171' }}>
+                            +{p.returnPct.toFixed(2)}%
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                  <tfoot>
+                    <tr style={{ borderTop: '2px solid #374151', backgroundColor: '#0a0d14' }}>
+                      <td style={{ padding: '14px 8px', fontWeight: 700, color: '#fff' }}>TOTAL FUNDS</td>
+                      <td></td>
+                      <td></td>
+                      <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 700, color: '#fff' }}>{fmt(fundMetrics.val)}</td>
+                      <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 700, color: fundMetrics.pct >= 0 ? '#34d399' : '#f87171' }}>
+                        +{fundMetrics.pct.toFixed(2)}%
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            </div>
+
             {/* Current Holdings Table */}
             <div style={{ ...styles.chartCard, marginBottom: 24 }}>
-              <h3 style={{ ...styles.chartTitle, marginBottom: 16 }}>Current Positions</h3>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 16 }}>📈 Stocks & ETFs</h3>
               {!positions.length ? (
-                <p style={{ color: '#6b7280', textAlign: 'center', padding: 40 }}>No open positions</p>
+                <p style={{ color: '#6b7280', textAlign: 'center', padding: 40 }}>No stock positions. Configure Supabase in Settings to load your trades.</p>
               ) : (
                 <div style={{ overflowX: 'auto' }}>
                   <table style={{ width: '100%', borderCollapse: 'collapse' }}>
@@ -1089,7 +1258,7 @@ export default function PortfolioDashboard() {
                         <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Current</th>
                         <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Value</th>
                         <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Unrealized</th>
-                        <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Today</th>
+                        <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Day %</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1102,7 +1271,6 @@ export default function PortfolioDashboard() {
                             <td style={{ padding: '14px 8px' }}>
                               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                                 <span style={{ fontWeight: 600 }}>{p.symbol}</span>
-                                <span style={{ fontSize: 11, padding: '2px 6px', borderRadius: 4, backgroundColor: p.type === 'ETF' ? 'rgba(99,102,241,0.2)' : p.type === 'Crypto' ? 'rgba(251,191,36,0.2)' : 'rgba(52,211,153,0.2)', color: p.type === 'ETF' ? '#818cf8' : p.type === 'Crypto' ? '#fbbf24' : '#34d399' }}>{p.type}</span>
                                 {p.priceSource && <span style={{ fontSize: 9, color: '#6366f1' }}>●</span>}
                               </div>
                             </td>
@@ -1638,17 +1806,20 @@ export default function PortfolioDashboard() {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
               <div>
                 <h3 style={{ fontSize: 26, fontWeight: 700, margin: 0 }}>
-                  {selectedPosition.symbol}
+                  {selectedPosition.isFund ? selectedPosition.name : selectedPosition.symbol}
                   {selectedPosition.priceSource && <span style={{ fontSize: 12, color: '#6366f1', marginLeft: 12, fontWeight: 500 }}>● LIVE</span>}
+                  {selectedPosition.isFund && <span style={{ fontSize: 12, color: '#a78bfa', marginLeft: 12, fontWeight: 500 }}>FUND</span>}
                 </h3>
-                <p style={{ color: '#6b7280', margin: '6px 0 0', fontSize: 14 }}>{selectedPosition.type} • {selectedPosition.exchange || 'Unknown Exchange'}</p>
+                <p style={{ color: '#6b7280', margin: '6px 0 0', fontSize: 14 }}>
+                  {selectedPosition.isFund ? `ISIN: ${selectedPosition.isin}` : `${selectedPosition.type} • ${selectedPosition.exchange || 'Unknown Exchange'}`}
+                </p>
               </div>
               <button onClick={() => setSelectedPosition(null)} style={{ ...styles.btn, padding: '8px 14px', fontSize: 16 }}>✕</button>
             </div>
             
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 24 }}>
               <div style={{ padding: 20, borderRadius: 14, backgroundColor: '#0a0d14' }}>
-                <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Shares Held</p>
+                <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>{selectedPosition.isFund ? 'Units Held' : 'Shares Held'}</p>
                 <p style={{ color: '#fff', fontSize: 24, fontWeight: 700, margin: '6px 0 0' }}>{selectedPosition.shares.toFixed(4)}</p>
               </div>
               <div style={{ padding: 20, borderRadius: 14, backgroundColor: '#0a0d14' }}>
@@ -1656,9 +1827,14 @@ export default function PortfolioDashboard() {
                 <p style={{ color: '#fff', fontSize: 24, fontWeight: 700, margin: '6px 0 0' }}>{fmt(selectedPosition.avgPrice, selectedPosition.currency)}</p>
               </div>
               <div style={{ padding: 20, borderRadius: 14, backgroundColor: '#0a0d14' }}>
-                <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Current Price</p>
+                <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>{selectedPosition.isFund ? 'NAV' : 'Current Price'}</p>
                 <p style={{ color: '#fff', fontSize: 24, fontWeight: 700, margin: '6px 0 0' }}>{fmt(selectedPosition.currentPrice, selectedPosition.priceCurrency || selectedPosition.currency)}</p>
-                {selectedPosition.priceChangePct !== undefined && selectedPosition.priceChangePct !== 0 && (
+                {selectedPosition.isFund && selectedPosition.returnPct !== undefined && (
+                  <p style={{ color: selectedPosition.returnPct >= 0 ? '#34d399' : '#f87171', fontSize: 13, margin: '4px 0 0' }}>
+                    +{selectedPosition.returnPct.toFixed(2)}% total return
+                  </p>
+                )}
+                {!selectedPosition.isFund && selectedPosition.priceChangePct !== undefined && selectedPosition.priceChangePct !== 0 && (
                   <p style={{ color: selectedPosition.priceChangePct >= 0 ? '#34d399' : '#f87171', fontSize: 13, margin: '4px 0 0' }}>
                     {selectedPosition.priceChangePct >= 0 ? '▲' : '▼'} {Math.abs(selectedPosition.priceChangePct).toFixed(2)}% today
                   </p>
@@ -1675,31 +1851,42 @@ export default function PortfolioDashboard() {
                 <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Cost Basis</p>
                 <p style={{ color: '#fff', fontSize: 22, fontWeight: 600, margin: '6px 0 0' }}>{fmt(selectedPosition.shares * selectedPosition.avgPrice, selectedPosition.currency)}</p>
               </div>
-              {gains.bySymbol.find(g => g.symbol === selectedPosition.symbol) && (
-                <div style={{ padding: 20, borderRadius: 14, backgroundColor: gains.bySymbol.find(g => g.symbol === selectedPosition.symbol).unrealized >= 0 ? 'rgba(52,211,153,0.1)' : 'rgba(248,113,113,0.1)', border: `1px solid ${gains.bySymbol.find(g => g.symbol === selectedPosition.symbol).unrealized >= 0 ? 'rgba(52,211,153,0.2)' : 'rgba(248,113,113,0.2)'}` }}>
-                  <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Unrealized P&L</p>
-                  <p style={{ color: gains.bySymbol.find(g => g.symbol === selectedPosition.symbol).unrealized >= 0 ? '#34d399' : '#f87171', fontSize: 22, fontWeight: 600, margin: '6px 0 0' }}>
-                    {fmt(gains.bySymbol.find(g => g.symbol === selectedPosition.symbol).unrealized)}
-                    <span style={{ fontSize: 14, fontWeight: 400, marginLeft: 8 }}>
-                      ({((gains.bySymbol.find(g => g.symbol === selectedPosition.symbol).unrealized / (selectedPosition.shares * selectedPosition.avgPrice)) * 100).toFixed(1)}%)
-                    </span>
-                  </p>
-                </div>
-              )}
+              <div style={{ padding: 20, borderRadius: 14, backgroundColor: ((selectedPosition.shares * selectedPosition.currentPrice) - (selectedPosition.shares * selectedPosition.avgPrice)) >= 0 ? 'rgba(52,211,153,0.1)' : 'rgba(248,113,113,0.1)', border: `1px solid ${((selectedPosition.shares * selectedPosition.currentPrice) - (selectedPosition.shares * selectedPosition.avgPrice)) >= 0 ? 'rgba(52,211,153,0.2)' : 'rgba(248,113,113,0.2)'}` }}>
+                <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Unrealized P&L</p>
+                {(() => {
+                  const unrealized = toEUR(selectedPosition.shares * selectedPosition.currentPrice, selectedPosition.priceCurrency || selectedPosition.currency) - toEUR(selectedPosition.shares * selectedPosition.avgPrice, selectedPosition.currency);
+                  const unrealizedPct = (unrealized / (selectedPosition.shares * selectedPosition.avgPrice)) * 100;
+                  return (
+                    <p style={{ color: unrealized >= 0 ? '#34d399' : '#f87171', fontSize: 22, fontWeight: 600, margin: '6px 0 0' }}>
+                      {fmt(unrealized)}
+                      <span style={{ fontSize: 14, fontWeight: 400, marginLeft: 8 }}>
+                        ({unrealizedPct >= 0 ? '+' : ''}{unrealizedPct.toFixed(1)}%)
+                      </span>
+                    </p>
+                  );
+                })()}
+              </div>
             </div>
             
-            <h4 style={{ color: '#fff', marginBottom: 14, fontWeight: 600 }}>Transaction History</h4>
-            <div style={{ maxHeight: 280, overflowY: 'auto' }}>
-              {trades.filter(t => t.symbol === selectedPosition.symbol).sort((a, b) => new Date(b.date) - new Date(a.date)).map((t, i) => (
-                <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: 14, borderRadius: 10, backgroundColor: '#0a0d14', marginBottom: 8 }}>
-                  <div>
-                    <span style={{ padding: '3px 8px', borderRadius: 5, fontSize: 10, fontWeight: 600, backgroundColor: t.type === 'buy' ? 'rgba(52,211,153,0.2)' : 'rgba(248,113,113,0.2)', color: t.type === 'buy' ? '#34d399' : '#f87171', marginRight: 10 }}>{t.type.toUpperCase()}</span>
-                    <span style={{ color: '#9ca3af', fontSize: 13 }}>{fmtDate(t.date)}</span>
-                  </div>
-                  <span style={{ color: '#d1d5db', fontSize: 14 }}>{t.shares.toFixed(4)} @ {fmt(t.price, t.currency)}</span>
+            {!selectedPosition.isFund && (
+              <>
+                <h4 style={{ color: '#fff', marginBottom: 14, fontWeight: 600 }}>Transaction History</h4>
+                <div style={{ maxHeight: 280, overflowY: 'auto' }}>
+                  {trades.filter(t => t.symbol === selectedPosition.symbol).sort((a, b) => new Date(b.date) - new Date(a.date)).map((t, i) => (
+                    <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: 14, borderRadius: 10, backgroundColor: '#0a0d14', marginBottom: 8 }}>
+                      <div>
+                        <span style={{ padding: '3px 8px', borderRadius: 5, fontSize: 10, fontWeight: 600, backgroundColor: t.type === 'buy' ? 'rgba(52,211,153,0.2)' : 'rgba(248,113,113,0.2)', color: t.type === 'buy' ? '#34d399' : '#f87171', marginRight: 10 }}>{t.type.toUpperCase()}</span>
+                        <span style={{ color: '#9ca3af', fontSize: 13 }}>{fmtDate(t.date)}</span>
+                      </div>
+                      <span style={{ color: '#d1d5db', fontSize: 14 }}>{t.shares.toFixed(4)} @ {fmt(t.price, t.currency)}</span>
+                    </div>
+                  ))}
+                  {trades.filter(t => t.symbol === selectedPosition.symbol).length === 0 && (
+                    <p style={{ color: '#6b7280', textAlign: 'center', padding: 20 }}>No transactions recorded for this position</p>
+                  )}
                 </div>
-              ))}
-            </div>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -1844,6 +2031,31 @@ export default function PortfolioDashboard() {
               <input type="password" value={sbKey} onChange={e => setSbKey(e.target.value)} style={styles.input} placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." />
               <label style={styles.inputLabel}>Table Name</label>
               <input type="text" value={sbTable} onChange={e => setSbTable(e.target.value)} style={{...styles.input, marginBottom: 0}} placeholder="transactions" />
+            </div>
+            
+            <div style={{ marginBottom: 24, padding: 16, borderRadius: 12, backgroundColor: '#0a0d14' }}>
+              <h4 style={{ color: '#fff', margin: '0 0 16px', fontSize: 16 }}>🏦 Robeco Fund NAVs</h4>
+              <p style={{ fontSize: 12, color: '#6b7280', margin: '0 0 12px' }}>
+                Update NAV values from your Evi app or Robeco website. Values are saved locally.
+              </p>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                {Object.entries(ROBECO_FUNDS).map(([symbol, fund]) => (
+                  <div key={symbol}>
+                    <label style={{ ...styles.inputLabel, fontSize: 11 }}>{fund.name.replace('Robeco ONE ', '')}</label>
+                    <input 
+                      type="number" 
+                      step="0.01"
+                      value={fundNavs[symbol] || fund.defaultNav} 
+                      onChange={e => setFundNavs({...fundNavs, [symbol]: parseFloat(e.target.value) || fund.defaultNav})}
+                      style={{...styles.input, marginBottom: 0, padding: '10px 12px'}} 
+                      placeholder={fund.defaultNav.toString()} 
+                    />
+                  </div>
+                ))}
+              </div>
+              <div style={{ marginTop: 12, padding: 12, borderRadius: 8, backgroundColor: '#111827' }}>
+                <p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>Total Fund Value: <span style={{ color: '#34d399', fontWeight: 600 }}>{fmt(fundMetrics.val)}</span></p>
+              </div>
             </div>
             
             <div style={{ marginBottom: 24, padding: 16, borderRadius: 12, backgroundColor: '#0a0d14' }}>
