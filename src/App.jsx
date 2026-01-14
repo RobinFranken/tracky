@@ -672,7 +672,7 @@ export default function PortfolioDashboard() {
 
   // Gains Analysis (FIFO)
   const gains = useMemo(() => {
-    const results = { bySymbol: [], realized: 0, unrealized: 0, proceeds: 0, costSold: 0, shortRealized: 0, longRealized: 0, shortUnrealized: 0, longUnrealized: 0, salesDetail: [] };
+    const results = { bySymbol: [], realized: 0, unrealized: 0, proceeds: 0, costSold: 0, shortRealized: 0, longRealized: 0, shortUnrealized: 0, longUnrealized: 0, salesDetail: [], realizedByYear: {} };
     if (!trades.length) return results;
     
     const symbols = [...new Set(trades.map(t => t.symbol))];
@@ -715,6 +715,11 @@ export default function PortfolioDashboard() {
           const costBasisEUR = toEUR(costBasis, ccy);
           const days = lotsUsed.length ? Math.ceil((new Date(t.date) - new Date(lotsUsed[0].date)) / 86400000) : 0;
           const isLong = days > 365;
+          
+          // Track realized gains by year
+          const saleYear = new Date(t.date).getFullYear();
+          if (!results.realizedByYear[saleYear]) results.realizedByYear[saleYear] = 0;
+          results.realizedByYear[saleYear] += gainEUR;
           
           // Track this sale in detail
           results.salesDetail.push({
@@ -1061,41 +1066,108 @@ export default function PortfolioDashboard() {
 
         {/* HOLDINGS TAB */}
         {activeTab === 'holdings' && (
-          <div style={styles.chartCard}>
+          <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-              <h3 style={styles.chartTitle}>All Holdings ({positions.length})</h3>
-              <button onClick={() => fetchPrices(positions)} disabled={priceProgress.loading} style={{ ...styles.btn, padding: '8px 16px', fontSize: 13 }}>
+              <h2 style={{ fontSize: 22, fontWeight: 600 }}>Holdings ({positions.length})</h2>
+              <button onClick={() => fetchPrices(positions)} disabled={priceProgress.loading} style={styles.btn}>
                 {priceProgress.loading ? `Updating ${priceProgress.current}/${priceProgress.total}...` : '💹 Update Prices'}
               </button>
             </div>
-            {[...positions].sort((a, b) => toEUR(b.shares * b.currentPrice, b.currency) - toEUR(a.shares * a.currentPrice, a.currency)).map((p, idx) => (
-              <div key={p.symbol} onClick={() => setSelectedPosition(p)} style={styles.row} onMouseOver={e => Object.assign(e.currentTarget.style, styles.rowHover)} onMouseOut={e => Object.assign(e.currentTarget.style, { backgroundColor: '#0a0d14', borderColor: 'transparent' })}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-                  <div style={{ width: 48, height: 48, borderRadius: 12, background: `linear-gradient(135deg, ${COLORS[idx % COLORS.length]}40, ${COLORS[idx % COLORS.length]}20)`, border: `1px solid ${COLORS[idx % COLORS.length]}50`, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 12, color: COLORS[idx % COLORS.length] }}>{p.symbol.slice(0, 4)}</div>
-                  <div>
-                    <p style={{ fontWeight: 600, margin: 0, fontSize: 15 }}>
-                      {p.symbol} <span style={{ fontSize: 12, color: '#6b7280', fontWeight: 400 }}>{p.type}</span>
-                      {p.priceSource && <span style={{ fontSize: 10, color: '#6366f1', marginLeft: 8 }}>● LIVE</span>}
-                    </p>
-                    <p style={{ fontSize: 13, color: '#6b7280', margin: '2px 0 0' }}>
-                      {p.shares.toFixed(4)} shares • Avg: {fmt(p.avgPrice, p.currency)} • Now: {fmt(p.currentPrice, p.priceCurrency || p.currency)}
-                    </p>
-                  </div>
+
+            {/* Current Holdings Table */}
+            <div style={{ ...styles.chartCard, marginBottom: 24 }}>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 16 }}>Current Positions</h3>
+              {!positions.length ? (
+                <p style={{ color: '#6b7280', textAlign: 'center', padding: 40 }}>No open positions</p>
+              ) : (
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                    <thead>
+                      <tr style={{ borderBottom: '1px solid #1e293b' }}>
+                        <th style={{ textAlign: 'left', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Symbol</th>
+                        <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Shares</th>
+                        <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Avg Cost</th>
+                        <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Current</th>
+                        <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Value</th>
+                        <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Unrealized</th>
+                        <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Today</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...positions].sort((a, b) => toEUR(b.shares * b.currentPrice, b.currency) - toEUR(a.shares * a.currentPrice, a.currency)).map(p => {
+                        const value = toEUR(p.shares * p.currentPrice, p.priceCurrency || p.currency);
+                        const cost = toEUR(p.shares * p.avgPrice, p.currency);
+                        const unrealized = value - cost;
+                        return (
+                          <tr key={p.symbol} style={{ borderBottom: '1px solid #1e293b', cursor: 'pointer' }} onClick={() => setSelectedPosition(p)} onMouseOver={e => e.currentTarget.style.backgroundColor = '#1e293b'} onMouseOut={e => e.currentTarget.style.backgroundColor = 'transparent'}>
+                            <td style={{ padding: '14px 8px' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                                <span style={{ fontWeight: 600 }}>{p.symbol}</span>
+                                <span style={{ fontSize: 11, padding: '2px 6px', borderRadius: 4, backgroundColor: p.type === 'ETF' ? 'rgba(99,102,241,0.2)' : p.type === 'Crypto' ? 'rgba(251,191,36,0.2)' : 'rgba(52,211,153,0.2)', color: p.type === 'ETF' ? '#818cf8' : p.type === 'Crypto' ? '#fbbf24' : '#34d399' }}>{p.type}</span>
+                                {p.priceSource && <span style={{ fontSize: 9, color: '#6366f1' }}>●</span>}
+                              </div>
+                            </td>
+                            <td style={{ padding: '14px 8px', textAlign: 'right', color: '#d1d5db' }}>{p.shares.toFixed(4)}</td>
+                            <td style={{ padding: '14px 8px', textAlign: 'right', color: '#9ca3af' }}>{fmt(p.avgPrice, p.currency)}</td>
+                            <td style={{ padding: '14px 8px', textAlign: 'right', color: '#d1d5db' }}>{fmt(p.currentPrice, p.priceCurrency || p.currency)}</td>
+                            <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: '#fff' }}>{fmt(value)}</td>
+                            <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: unrealized >= 0 ? '#34d399' : '#f87171' }}>{fmt(unrealized)}</td>
+                            <td style={{ padding: '14px 8px', textAlign: 'right', color: (p.priceChangePct || 0) >= 0 ? '#34d399' : '#f87171' }}>
+                              {p.priceChangePct !== undefined ? `${p.priceChangePct >= 0 ? '▲' : '▼'} ${Math.abs(p.priceChangePct).toFixed(2)}%` : '—'}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
                 </div>
-                <div style={{ textAlign: 'right' }}>
-                  <p style={{ fontWeight: 600, margin: 0, fontSize: 16 }}>{fmt(toEUR(p.shares * p.currentPrice, p.priceCurrency || p.currency))}</p>
-                  {p.priceChangePct !== undefined && p.priceChangePct !== 0 ? (
-                    <p style={{ fontSize: 13, color: p.priceChangePct >= 0 ? '#34d399' : '#f87171', margin: '2px 0 0' }}>
-                      {p.priceChangePct >= 0 ? '▲' : '▼'} {Math.abs(p.priceChangePct).toFixed(2)}% today
-                    </p>
-                  ) : (
-                    <p style={{ fontSize: 13, color: gains.bySymbol.find(g => g.symbol === p.symbol)?.unrealized >= 0 ? '#34d399' : '#f87171', margin: '2px 0 0' }}>
-                      {fmt(gains.bySymbol.find(g => g.symbol === p.symbol)?.unrealized || 0)} unrealized
-                    </p>
-                  )}
-                </div>
+              )}
+            </div>
+
+            {/* All Positions Breakdown (including sold) */}
+            <div style={styles.chartCard}>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 8 }}>All Positions Breakdown ({gains.bySymbol.length})</h3>
+              <p style={{ color: '#6b7280', fontSize: 13, marginBottom: 16 }}>Complete history including fully sold positions</p>
+              <div style={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid #1e293b' }}>
+                      <th style={{ textAlign: 'left', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Symbol</th>
+                      <th style={{ textAlign: 'center', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Buys</th>
+                      <th style={{ textAlign: 'center', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Sells</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Realized</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Unrealized</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Total Gain</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...gains.bySymbol].sort((a, b) => Math.abs(b.total) - Math.abs(a.total)).map(g => (
+                      <tr key={g.symbol} style={{ borderBottom: '1px solid #1e293b' }}>
+                        <td style={{ padding: '14px 8px' }}>
+                          <span style={{ fontWeight: 600 }}>{g.symbol}</span>
+                          {g.fullySold && <span style={{ marginLeft: 10, fontSize: 10, padding: '3px 8px', borderRadius: 6, backgroundColor: 'rgba(248,113,113,0.2)', color: '#f87171', fontWeight: 600 }}>SOLD</span>}
+                        </td>
+                        <td style={{ textAlign: 'center', padding: '14px 8px', color: '#34d399' }}>{g.buyCount}</td>
+                        <td style={{ textAlign: 'center', padding: '14px 8px', color: '#f87171' }}>{g.sellCount}</td>
+                        <td style={{ textAlign: 'right', padding: '14px 8px', color: g.realized >= 0 ? '#34d399' : '#f87171', fontWeight: 500 }}>{g.sellCount > 0 ? fmt(g.realized) : '—'}</td>
+                        <td style={{ textAlign: 'right', padding: '14px 8px', color: g.unrealized >= 0 ? '#34d399' : '#f87171', fontWeight: 500 }}>{g.fullySold ? '—' : fmt(g.unrealized)}</td>
+                        <td style={{ textAlign: 'right', padding: '14px 8px', color: g.total >= 0 ? '#34d399' : '#f87171', fontWeight: 700 }}>{fmt(g.total)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot>
+                    <tr style={{ borderTop: '2px solid #374151', backgroundColor: '#0a0d14' }}>
+                      <td style={{ padding: '14px 8px', fontWeight: 700, color: '#fff' }}>TOTAL</td>
+                      <td></td>
+                      <td></td>
+                      <td style={{ textAlign: 'right', padding: '14px 8px', fontWeight: 700, color: gains.realized >= 0 ? '#34d399' : '#f87171' }}>{fmt(gains.realized)}</td>
+                      <td style={{ textAlign: 'right', padding: '14px 8px', fontWeight: 700, color: gains.unrealized >= 0 ? '#34d399' : '#f87171' }}>{fmt(gains.unrealized)}</td>
+                      <td style={{ textAlign: 'right', padding: '14px 8px', fontWeight: 700, color: (gains.realized + gains.unrealized) >= 0 ? '#34d399' : '#f87171' }}>{fmt(gains.realized + gains.unrealized)}</td>
+                    </tr>
+                  </tfoot>
+                </table>
               </div>
-            ))}
+            </div>
           </div>
         )}
 
@@ -1157,7 +1229,7 @@ export default function PortfolioDashboard() {
                       <th style={{ textAlign: 'left', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Year</th>
                       <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Invested</th>
                       <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Sold</th>
-                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Net Flow</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Realized Gain</th>
                       <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Dividends</th>
                       <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Div Yield %</th>
                       <th style={{ textAlign: 'center', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Trades</th>
@@ -1166,6 +1238,7 @@ export default function PortfolioDashboard() {
                   <tbody>
                     {availableYears.map(year => {
                       const yp = yearlyPerformance[year] || {};
+                      const realizedGain = gains.realizedByYear[year] || 0;
                       // Calculate cumulative invested up to this year for dividend yield
                       const cumulativeInvested = availableYears
                         .filter(y => y <= year)
@@ -1177,8 +1250,8 @@ export default function PortfolioDashboard() {
                           <td style={{ padding: '14px 8px', fontWeight: 600, color: YEAR_COLORS[year] || '#fff' }}>{year}</td>
                           <td style={{ padding: '14px 8px', textAlign: 'right', color: '#6b7280' }}>{fmt(yp.invested || 0)}</td>
                           <td style={{ padding: '14px 8px', textAlign: 'right', color: '#6b7280' }}>{fmt(yp.proceeds || 0)}</td>
-                          <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: (yp.netFlow || 0) >= 0 ? '#34d399' : '#f87171' }}>
-                            {(yp.netFlow || 0) >= 0 ? '+' : ''}{fmt(yp.netFlow || 0)}
+                          <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: realizedGain >= 0 ? '#34d399' : '#f87171' }}>
+                            {realizedGain !== 0 ? fmt(realizedGain) : '—'}
                           </td>
                           <td style={{ padding: '14px 8px', textAlign: 'right', color: '#34d399' }}>{fmt(yp.dividends || 0)}</td>
                           <td style={{ padding: '14px 8px', textAlign: 'right', color: divYield > 0 ? '#34d399' : '#6b7280' }}>
@@ -1198,8 +1271,8 @@ export default function PortfolioDashboard() {
                       <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: '#6b7280' }}>
                         {fmt(availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.proceeds || 0), 0))}
                       </td>
-                      <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 700, color: availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.netFlow || 0), 0) >= 0 ? '#34d399' : '#f87171' }}>
-                        {fmt(availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.netFlow || 0), 0))}
+                      <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 700, color: gains.realized >= 0 ? '#34d399' : '#f87171' }}>
+                        {fmt(gains.realized)}
                       </td>
                       <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: '#34d399' }}>
                         {fmt(availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.dividends || 0), 0))}
@@ -1212,18 +1285,21 @@ export default function PortfolioDashboard() {
                   </tfoot>
                 </table>
               </div>
+              <p style={{ fontSize: 12, color: '#6b7280', marginTop: 16 }}>
+                💡 Realized Gain = Profit/loss locked in from sales (FIFO method). Does not include unrealized gains from price appreciation.
+              </p>
             </div>
 
             {/* Visual Chart */}
             <div style={{ ...styles.chartCard, marginTop: 24 }}>
-              <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>Net Annual Cash Flow</h3>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>Realized Gains & Dividends by Year</h3>
               <div style={{ height: 280 }}>
                 <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={availableYears.map(y => ({ year: y.toString(), netFlow: yearlyPerformance[y]?.netFlow || 0, dividends: yearlyPerformance[y]?.dividends || 0 })).reverse()}>
+                  <BarChart data={availableYears.map(y => ({ year: y.toString(), realized: gains.realizedByYear[y] || 0, dividends: yearlyPerformance[y]?.dividends || 0 })).reverse()}>
                     <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 12 }} />
                     <YAxis axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={v => `€${(v/1000).toFixed(0)}k`} />
                     <Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #374151', borderRadius: 12 }} formatter={v => fmt(v)} />
-                    <Bar dataKey="netFlow" fill="#6366f1" radius={[4, 4, 0, 0]} name="Net Flow" />
+                    <Bar dataKey="realized" fill="#6366f1" radius={[4, 4, 0, 0]} name="Realized Gain" />
                     <Bar dataKey="dividends" fill="#34d399" radius={[4, 4, 0, 0]} name="Dividends" />
                   </BarChart>
                 </ResponsiveContainer>
@@ -1235,97 +1311,64 @@ export default function PortfolioDashboard() {
         {/* GAINS TAB */}
         {activeTab === 'gains' && (
           <div>
-            <h2 style={{ fontSize: 22, fontWeight: 600, marginBottom: 8 }}>Realized vs Unrealized Gains</h2>
-            <p style={{ color: '#6b7280', marginBottom: 24 }}>Tax lot analysis using FIFO method • {trades.length} trades • {gains.bySymbol.filter(g => g.sellCount > 0).length} positions with sells</p>
+            <h2 style={{ fontSize: 22, fontWeight: 600, marginBottom: 8 }}>Realized Gains & Sale Proceeds</h2>
+            <p style={{ color: '#6b7280', marginBottom: 24 }}>Tax lot analysis using FIFO method • {gains.salesDetail.length} individual sales</p>
             
             <div style={{ ...styles.grid4, marginBottom: 24 }}>
               <div style={{ ...styles.card, background: 'linear-gradient(135deg, rgba(52,211,153,0.15), rgba(16,185,129,0.1))', borderColor: 'rgba(52,211,153,0.3)' }}>
-                <p style={styles.cardLabel}>Total Gain</p>
-                <p style={{ ...styles.cardValue, color: (gains.realized + gains.unrealized) >= 0 ? '#34d399' : '#f87171' }}>{fmt(gains.realized + gains.unrealized)}</p>
-              </div>
-              <div style={styles.card}>
-                <p style={styles.cardLabel}>Realized</p>
+                <p style={styles.cardLabel}>Total Realized</p>
                 <p style={{ ...styles.cardValue, color: gains.realized >= 0 ? '#34d399' : '#f87171' }}>{fmt(gains.realized)}</p>
-                <p style={{ ...styles.cardSub, color: '#6b7280' }}>From {gains.bySymbol.filter(g => g.sellCount > 0).length} positions sold</p>
-              </div>
-              <div style={styles.card}>
-                <p style={styles.cardLabel}>Unrealized</p>
-                <p style={{ ...styles.cardValue, color: gains.unrealized >= 0 ? '#34d399' : '#f87171' }}>{fmt(gains.unrealized)}</p>
-                <p style={{ ...styles.cardSub, color: '#6b7280' }}>Paper gains on holdings</p>
               </div>
               <div style={styles.card}>
                 <p style={styles.cardLabel}>Sale Proceeds</p>
                 <p style={styles.cardValue}>{fmt(gains.proceeds)}</p>
               </div>
+              <div style={styles.card}>
+                <p style={styles.cardLabel}>Cost Basis Sold</p>
+                <p style={styles.cardValue}>{fmt(gains.costSold)}</p>
+              </div>
+              <div style={styles.card}>
+                <p style={styles.cardLabel}>Positions Sold</p>
+                <p style={styles.cardValue}>{gains.bySymbol.filter(g => g.sellCount > 0).length}</p>
+              </div>
             </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24, marginBottom: 24 }}>
               <div style={styles.chartCard}>
-                <h4 style={{ color: '#fff', marginBottom: 16, fontWeight: 600 }}>Realized by Holding Period</h4>
+                <h4 style={{ color: '#fff', marginBottom: 16, fontWeight: 600 }}>By Holding Period</h4>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
                   <div style={{ padding: 16, borderRadius: 12, backgroundColor: '#0a0d14' }}>
-                    <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Short-term (&lt;1yr)</p>
+                    <p style={{ color: '#fbbf24', fontSize: 12, margin: 0 }}>Short-term (&lt;1yr)</p>
                     <p style={{ color: gains.shortRealized >= 0 ? '#34d399' : '#f87171', fontSize: 22, fontWeight: 600, margin: '6px 0 0' }}>{fmt(gains.shortRealized)}</p>
                   </div>
                   <div style={{ padding: 16, borderRadius: 12, backgroundColor: '#0a0d14' }}>
-                    <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Long-term (&gt;1yr)</p>
+                    <p style={{ color: '#34d399', fontSize: 12, margin: 0 }}>Long-term (&gt;1yr)</p>
                     <p style={{ color: gains.longRealized >= 0 ? '#34d399' : '#f87171', fontSize: 22, fontWeight: 600, margin: '6px 0 0' }}>{fmt(gains.longRealized)}</p>
                   </div>
                 </div>
               </div>
               <div style={styles.chartCard}>
-                <h4 style={{ color: '#fff', marginBottom: 16, fontWeight: 600 }}>Unrealized by Holding Period</h4>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
-                  <div style={{ padding: 16, borderRadius: 12, backgroundColor: '#0a0d14' }}>
-                    <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Short-term (&lt;1yr)</p>
-                    <p style={{ color: gains.shortUnrealized >= 0 ? '#34d399' : '#f87171', fontSize: 22, fontWeight: 600, margin: '6px 0 0' }}>{fmt(gains.shortUnrealized)}</p>
-                  </div>
-                  <div style={{ padding: 16, borderRadius: 12, backgroundColor: '#0a0d14' }}>
-                    <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Long-term (&gt;1yr)</p>
-                    <p style={{ color: gains.longUnrealized >= 0 ? '#34d399' : '#f87171', fontSize: 22, fontWeight: 600, margin: '6px 0 0' }}>{fmt(gains.longUnrealized)}</p>
-                  </div>
+                <h4 style={{ color: '#fff', marginBottom: 16, fontWeight: 600 }}>Realized by Year</h4>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                  {Object.entries(gains.realizedByYear || {}).sort((a, b) => b[0] - a[0]).map(([year, amount]) => (
+                    <div key={year} style={{ padding: '8px 12px', borderRadius: 8, backgroundColor: '#0a0d14', flex: '1 1 auto', minWidth: 100 }}>
+                      <p style={{ color: YEAR_COLORS[year] || '#6b7280', fontSize: 12, margin: 0 }}>{year}</p>
+                      <p style={{ color: amount >= 0 ? '#34d399' : '#f87171', fontSize: 16, fontWeight: 600, margin: '4px 0 0' }}>{fmt(amount)}</p>
+                    </div>
+                  ))}
                 </div>
               </div>
             </div>
 
-            <div style={styles.chartCard}>
-              <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>Position Breakdown ({gains.bySymbol.length})</h3>
-              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-                <thead>
-                  <tr style={{ borderBottom: '1px solid #1e293b' }}>
-                    <th style={{ textAlign: 'left', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Symbol</th>
-                    <th style={{ textAlign: 'center', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Buys</th>
-                    <th style={{ textAlign: 'center', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Sells</th>
-                    <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Realized</th>
-                    <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Unrealized</th>
-                    <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Total</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {[...gains.bySymbol].sort((a, b) => Math.abs(b.total) - Math.abs(a.total)).map(g => (
-                    <tr key={g.symbol} style={{ borderBottom: '1px solid #1e293b' }}>
-                      <td style={{ padding: '14px 8px' }}>
-                        <span style={{ fontWeight: 600 }}>{g.symbol}</span>
-                        {g.fullySold && <span style={{ marginLeft: 10, fontSize: 10, padding: '3px 8px', borderRadius: 6, backgroundColor: 'rgba(248,113,113,0.2)', color: '#f87171', fontWeight: 600 }}>SOLD</span>}
-                      </td>
-                      <td style={{ textAlign: 'center', padding: '14px 8px', color: '#34d399' }}>{g.buyCount}</td>
-                      <td style={{ textAlign: 'center', padding: '14px 8px', color: '#f87171' }}>{g.sellCount}</td>
-                      <td style={{ textAlign: 'right', padding: '14px 8px', color: g.realized >= 0 ? '#34d399' : '#f87171', fontWeight: 500 }}>{g.sellCount > 0 ? fmt(g.realized) : '—'}</td>
-                      <td style={{ textAlign: 'right', padding: '14px 8px', color: g.unrealized >= 0 ? '#34d399' : '#f87171', fontWeight: 500 }}>{g.fullySold ? '—' : fmt(g.unrealized)}</td>
-                      <td style={{ textAlign: 'right', padding: '14px 8px', color: g.total >= 0 ? '#34d399' : '#f87171', fontWeight: 700 }}>{fmt(g.total)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
             {/* Sale Proceeds Detail */}
-            {gains.salesDetail.length > 0 && (
-              <div style={{ ...styles.chartCard, marginTop: 24 }}>
-                <h3 style={{ ...styles.chartTitle, marginBottom: 8 }}>📋 Sale Proceeds Detail ({gains.salesDetail.length} sales)</h3>
-                <p style={{ color: '#6b7280', fontSize: 13, marginBottom: 20 }}>
-                  All individual sales reconciling to total proceeds of <span style={{ color: '#34d399', fontWeight: 600 }}>{fmt(gains.proceeds)}</span>
-                </p>
+            <div style={styles.chartCard}>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 8 }}>📋 Sale Proceeds Detail ({gains.salesDetail.length} sales)</h3>
+              <p style={{ color: '#6b7280', fontSize: 13, marginBottom: 20 }}>
+                All individual sales reconciling to total proceeds of <span style={{ color: '#34d399', fontWeight: 600 }}>{fmt(gains.proceeds)}</span>
+              </p>
+              {gains.salesDetail.length === 0 ? (
+                <p style={{ color: '#6b7280', textAlign: 'center', padding: 40 }}>No sales recorded yet</p>
+              ) : (
                 <div style={{ overflowX: 'auto' }}>
                   <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                     <thead>
@@ -1369,8 +1412,8 @@ export default function PortfolioDashboard() {
                     </tfoot>
                   </table>
                 </div>
-              </div>
-            )}
+              )}
+            </div>
           </div>
         )}
 
