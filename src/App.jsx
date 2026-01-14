@@ -196,8 +196,8 @@ const PriceService = {
   // Yahoo Finance via CORS proxy
   async fetchYahoo(symbol, exchange) {
     const ySymbol = this.getYahooSymbol(symbol, exchange);
-    // Use corsproxy.io which is reliable and free
-    const targetUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${ySymbol}?interval=1d&range=5d`;
+    // Use quote endpoint for more accurate real-time data
+    const targetUrl = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${ySymbol}`;
     const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
     
     try {
@@ -212,46 +212,39 @@ const PriceService = {
       }
       
       const data = await res.json();
-      const quote = data.chart?.result?.[0]?.meta;
+      const quote = data.quoteResponse?.result?.[0];
       
       if (quote?.regularMarketPrice && quote.regularMarketPrice > 0) {
         let price = quote.regularMarketPrice;
-        let prevClose = quote.previousClose || quote.chartPreviousClose || price;
+        let prevClose = quote.regularMarketPreviousClose || price;
         let currency = (quote.currency || 'USD').toUpperCase();
+        // Use Yahoo's built-in change percent for accuracy
+        let changePct = quote.regularMarketChangePercent || 0;
         
-        console.log(`[Yahoo] ${ySymbol} raw: ${price} ${quote.currency}`);
+        console.log(`[Yahoo] ${ySymbol} raw: price=${price}, prevClose=${prevClose}, changePct=${changePct?.toFixed(2)}%, currency=${currency}`);
         
-        // UK stocks return prices in pence (GBX/GBp/GBP with high values), convert to pounds
-        // Check for GBX, GBp, or GBP with suspiciously high values (>500 suggests pence)
-        const isUKPence = currency === 'GBP' || currency === 'GBX' || currency === 'GBp';
-        const isProbablyPence = isUKPence && price > 500; // Most UK stocks < £500, if >500 it's likely pence
+        // UK stocks return prices in pence (GBX/GBp), convert to pounds
+        const isUKPence = currency === 'GBX' || currency === 'GBp';
+        const isLondonStock = exchange?.toUpperCase()?.includes('LON') || exchange?.toUpperCase() === 'XLON';
         
-        // Also check if exchange is London
-        const isLondonStock = exchange?.toUpperCase()?.includes('LON') || exchange?.toUpperCase() === 'XLON' || exchange?.toUpperCase() === 'L';
-        
-        if ((currency === 'GBX' || currency.toLowerCase() === 'gbp') && (isProbablyPence || isLondonStock && price > 100)) {
+        if (isUKPence || (currency === 'GBP' && isLondonStock && price > 500)) {
           console.log(`[Yahoo] ${ySymbol} detected as UK pence, converting: ${price} pence → ${price/100} GBP`);
-          price = price / 100;
-          prevClose = prevClose / 100;
-          currency = 'GBP';
-        } else if (currency === 'GBX') {
-          // Always convert GBX regardless
           price = price / 100;
           prevClose = prevClose / 100;
           currency = 'GBP';
         }
         
-        console.log(`[Yahoo] ${ySymbol} final: ${price} ${currency}`);
+        console.log(`[Yahoo] ${ySymbol} final: ${price.toFixed(2)} ${currency}, ${changePct?.toFixed(2)}% today`);
         return {
           price,
           prevClose,
           change: price - prevClose,
-          changePct: prevClose > 0 ? ((price - prevClose) / prevClose) * 100 : 0,
+          changePct: changePct || 0, // Use Yahoo's percentage directly
           currency,
           source: 'yahoo'
         };
       }
-      console.log(`[Yahoo] ${ySymbol} no price data`);
+      console.log(`[Yahoo] ${ySymbol} no price data in response`);
     } catch (e) { 
       console.log(`[Yahoo] ${ySymbol} error:`, e.message);
       this.errors.push({ symbol, source: 'yahoo', error: e.message });
@@ -487,6 +480,13 @@ export default function PortfolioDashboard() {
   const [finnhubKey, setFinnhubKey] = useState(loadStorage('finnhub_key', ''));
   const [priceProgress, setPriceProgress] = useState({ loading: false, current: 0, total: 0 });
   const [lastPriceUpdate, setLastPriceUpdate] = useState(null);
+  
+  // Year-end snapshots for tracking YoY returns
+  const [snapshots, setSnapshots] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('portfolio_snapshots') || '{}');
+    } catch { return {}; }
+  });
 
   // Initialize price service
   useEffect(() => {
@@ -655,6 +655,34 @@ export default function PortfolioDashboard() {
       setStatus({ state: 'error', msg: `Failed to add: ${e.message}` });
     }
     setTimeout(() => setStatus({ state: 'idle', msg: '' }), 5000);
+  };
+
+  // Save year-end snapshot
+  const saveSnapshot = (year, portfolioValue, costBasis) => {
+    const newSnapshots = {
+      ...snapshots,
+      [year]: {
+        date: new Date().toISOString(),
+        portfolioValue,
+        costBasis,
+        realizedGains: 0, // Will be set later after gains calc
+        totalDividends: 0,
+        positionCount: positions.length
+      }
+    };
+    
+    setSnapshots(newSnapshots);
+    localStorage.setItem('portfolio_snapshots', JSON.stringify(newSnapshots));
+    setStatus({ state: 'success', msg: `✓ Saved snapshot for ${year}` });
+    setTimeout(() => setStatus({ state: 'idle', msg: '' }), 3000);
+  };
+  
+  // Delete snapshot
+  const deleteSnapshot = (year) => {
+    const newSnapshots = { ...snapshots };
+    delete newSnapshots[year];
+    setSnapshots(newSnapshots);
+    localStorage.setItem('portfolio_snapshots', JSON.stringify(newSnapshots));
   };
 
   // Metrics
@@ -1303,6 +1331,106 @@ export default function PortfolioDashboard() {
                     <Bar dataKey="dividends" fill="#34d399" radius={[4, 4, 0, 0]} name="Dividends" />
                   </BarChart>
                 </ResponsiveContainer>
+              </div>
+            </div>
+
+            {/* Year-End Snapshots */}
+            <div style={{ ...styles.chartCard, marginTop: 24 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+                <div>
+                  <h3 style={styles.chartTitle}>📸 Year-End Snapshots</h3>
+                  <p style={{ color: '#6b7280', fontSize: 13, margin: '4px 0 0' }}>Track portfolio value at year-end to calculate annual returns</p>
+                </div>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  {[2024, 2025, 2026].map(y => (
+                    <button 
+                      key={y} 
+                      onClick={() => saveSnapshot(y, metrics.val, metrics.cost)}
+                      style={{ ...styles.btn, padding: '8px 12px', fontSize: 12 }}
+                      disabled={!positions.length}
+                    >
+                      Save {y}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {Object.keys(snapshots).length === 0 ? (
+                <div style={{ padding: 40, textAlign: 'center' }}>
+                  <p style={{ color: '#6b7280' }}>No snapshots saved yet.</p>
+                  <p style={{ color: '#6b7280', fontSize: 13 }}>Save a snapshot at year-end to track your annual portfolio returns.</p>
+                </div>
+              ) : (
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                    <thead>
+                      <tr style={{ borderBottom: '1px solid #1e293b' }}>
+                        <th style={{ textAlign: 'left', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Year End</th>
+                        <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Portfolio Value</th>
+                        <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Cost Basis</th>
+                        <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Total Return</th>
+                        <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>YoY Change</th>
+                        <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>YoY %</th>
+                        <th style={{ textAlign: 'center', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.keys(snapshots).sort((a, b) => b - a).map((year, idx, arr) => {
+                        const snap = snapshots[year];
+                        const prevYear = arr[idx + 1];
+                        const prevSnap = prevYear ? snapshots[prevYear] : null;
+                        const totalReturn = snap.portfolioValue - snap.costBasis;
+                        const totalReturnPct = snap.costBasis > 0 ? (totalReturn / snap.costBasis) * 100 : 0;
+                        const yoyChange = prevSnap ? snap.portfolioValue - prevSnap.portfolioValue : null;
+                        const yoyPct = prevSnap && prevSnap.portfolioValue > 0 ? ((snap.portfolioValue - prevSnap.portfolioValue) / prevSnap.portfolioValue) * 100 : null;
+                        
+                        return (
+                          <tr key={year} style={{ borderBottom: '1px solid #1e293b' }}>
+                            <td style={{ padding: '14px 8px', fontWeight: 600, color: YEAR_COLORS[year] || '#fff' }}>
+                              Dec {year}
+                              <span style={{ fontSize: 11, color: '#6b7280', marginLeft: 8 }}>
+                                ({new Date(snap.date).toLocaleDateString()})
+                              </span>
+                            </td>
+                            <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: '#fff' }}>{fmt(snap.portfolioValue)}</td>
+                            <td style={{ padding: '14px 8px', textAlign: 'right', color: '#6b7280' }}>{fmt(snap.costBasis)}</td>
+                            <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: totalReturn >= 0 ? '#34d399' : '#f87171' }}>
+                              {fmt(totalReturn)} ({totalReturnPct.toFixed(1)}%)
+                            </td>
+                            <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: yoyChange !== null ? (yoyChange >= 0 ? '#34d399' : '#f87171') : '#6b7280' }}>
+                              {yoyChange !== null ? fmt(yoyChange) : '—'}
+                            </td>
+                            <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 700, color: yoyPct !== null ? (yoyPct >= 0 ? '#34d399' : '#f87171') : '#6b7280' }}>
+                              {yoyPct !== null ? `${yoyPct >= 0 ? '+' : ''}${yoyPct.toFixed(2)}%` : '—'}
+                            </td>
+                            <td style={{ padding: '14px 8px', textAlign: 'center' }}>
+                              <button onClick={() => deleteSnapshot(year)} style={{ background: 'none', border: 'none', color: '#f87171', cursor: 'pointer', fontSize: 14 }}>🗑️</button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {/* Current Portfolio for Reference */}
+              <div style={{ marginTop: 20, padding: 16, borderRadius: 12, backgroundColor: '#0a0d14', border: '1px dashed #374151' }}>
+                <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Current Portfolio (Live)</p>
+                <div style={{ display: 'flex', gap: 24, marginTop: 8 }}>
+                  <div>
+                    <p style={{ color: '#fff', fontSize: 20, fontWeight: 700, margin: 0 }}>{fmt(metrics.val)}</p>
+                    <p style={{ color: '#6b7280', fontSize: 11 }}>Market Value</p>
+                  </div>
+                  <div>
+                    <p style={{ color: '#6b7280', fontSize: 20, fontWeight: 600, margin: 0 }}>{fmt(metrics.cost)}</p>
+                    <p style={{ color: '#6b7280', fontSize: 11 }}>Cost Basis</p>
+                  </div>
+                  <div>
+                    <p style={{ color: metrics.gain >= 0 ? '#34d399' : '#f87171', fontSize: 20, fontWeight: 700, margin: 0 }}>{fmt(metrics.gain)}</p>
+                    <p style={{ color: '#6b7280', fontSize: 11 }}>Unrealized P/L ({metrics.pct.toFixed(1)}%)</p>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
