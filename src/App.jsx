@@ -7,6 +7,15 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, 
 
 const COLORS = ['#6366f1', '#a855f7', '#ec4899', '#f43f5e', '#f97316', '#eab308', '#22c55e', '#14b8a6', '#3b82f6', '#8b5cf6'];
 const YEAR_COLORS = { 2021: '#94a3b8', 2022: '#f87171', 2023: '#fbbf24', 2024: '#34d399', 2025: '#818cf8', 2026: '#a78bfa' };
+
+// Historical year-end portfolio values (combined USD + EUR accounts, converted to EUR)
+const HISTORICAL_PORTFOLIO_VALUES = {
+  2021: { value: 10913, note: 'USD $10,633 + EUR €1,556' },
+  2022: { value: 9074, note: 'USD $8,114 + EUR €1,447' },
+  2023: { value: 16084, note: 'USD $15,159 + EUR €2,289' },
+  2024: { value: 21062, note: 'USD $16,908 + EUR €4,830' },
+  2025: { value: 26558, note: 'USD $21,643 + EUR €6,646' }
+};
 const TIMEFRAMES = [
   { key: '1W', label: '1W', days: 7 },
   { key: '1M', label: '1M', days: 30 },
@@ -813,16 +822,6 @@ export default function PortfolioDashboard() {
   const yearlyPerformance = useMemo(() => generateYearlyPerformance(trades, positions, dividends), [trades, positions, dividends]);
   const availableYears = useMemo(() => Object.keys(yearlyPerformance).map(Number).sort((a, b) => b - a), [yearlyPerformance]);
 
-  // Top movers (positions with live prices)
-  const topMovers = useMemo(() => {
-    const withPrices = positions.filter(p => p.priceChangePct !== undefined && p.priceChangePct !== 0);
-    const sorted = [...withPrices].sort((a, b) => b.priceChangePct - a.priceChangePct);
-    return {
-      gainers: sorted.filter(p => p.priceChangePct > 0).slice(0, 5),
-      losers: sorted.filter(p => p.priceChangePct < 0).slice(-5).reverse()
-    };
-  }, [positions]);
-
   // Yearly chart data
   const yearlyChartData = useMemo(() => {
     return availableYears.map(year => ({
@@ -1174,54 +1173,159 @@ export default function PortfolioDashboard() {
         {/* PERFORMANCE TAB */}
         {activeTab === 'performance' && (
           <div>
-            {/* Top Daily Movers */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24, marginBottom: 24 }}>
-              {/* Top Gainers */}
-              <div style={styles.chartCard}>
-                <h3 style={{ ...styles.chartTitle, marginBottom: 16, color: '#34d399' }}>📈 Top Gainers Today</h3>
-                {topMovers.gainers.length === 0 ? (
-                  <p style={{ color: '#6b7280', textAlign: 'center', padding: 20 }}>No price data yet. Click "💹 Prices" to fetch live data.</p>
-                ) : (
-                  topMovers.gainers.map((p, idx) => (
-                    <div key={p.symbol} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 12, borderRadius: 10, backgroundColor: '#0a0d14', marginBottom: 8 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                        <span style={{ width: 28, height: 28, borderRadius: 8, backgroundColor: 'rgba(52,211,153,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700, color: '#34d399' }}>{idx + 1}</span>
-                        <div>
-                          <p style={{ fontWeight: 600, margin: 0, fontSize: 14 }}>{p.symbol}</p>
-                          <p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>{fmt(p.currentPrice, p.priceCurrency || p.currency)}</p>
-                        </div>
-                      </div>
-                      <span style={{ fontSize: 16, fontWeight: 700, color: '#34d399' }}>▲ {p.priceChangePct.toFixed(2)}%</span>
-                    </div>
-                  ))
-                )}
-              </div>
-
-              {/* Top Losers */}
-              <div style={styles.chartCard}>
-                <h3 style={{ ...styles.chartTitle, marginBottom: 16, color: '#f87171' }}>📉 Top Losers Today</h3>
-                {topMovers.losers.length === 0 ? (
-                  <p style={{ color: '#6b7280', textAlign: 'center', padding: 20 }}>No price data yet. Click "💹 Prices" to fetch live data.</p>
-                ) : (
-                  topMovers.losers.map((p, idx) => (
-                    <div key={p.symbol} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: 12, borderRadius: 10, backgroundColor: '#0a0d14', marginBottom: 8 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                        <span style={{ width: 28, height: 28, borderRadius: 8, backgroundColor: 'rgba(248,113,113,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 700, color: '#f87171' }}>{idx + 1}</span>
-                        <div>
-                          <p style={{ fontWeight: 600, margin: 0, fontSize: 14 }}>{p.symbol}</p>
-                          <p style={{ fontSize: 12, color: '#6b7280', margin: 0 }}>{fmt(p.currentPrice, p.priceCurrency || p.currency)}</p>
-                        </div>
-                      </div>
-                      <span style={{ fontSize: 16, fontWeight: 700, color: '#f87171' }}>▼ {Math.abs(p.priceChangePct).toFixed(2)}%</span>
-                    </div>
-                  ))
-                )}
+            {/* Portfolio Returns Summary */}
+            <div style={{ ...styles.chartCard, marginBottom: 24 }}>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>📈 Portfolio Returns</h3>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16 }}>
+                <div style={{ padding: 20, borderRadius: 12, backgroundColor: '#0a0d14' }}>
+                  <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Total Money In (Buys)</p>
+                  <p style={{ color: '#f87171', fontSize: 24, fontWeight: 700, margin: '8px 0 0' }}>
+                    {fmt(availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.invested || 0), 0))}
+                  </p>
+                </div>
+                <div style={{ padding: 20, borderRadius: 12, backgroundColor: '#0a0d14' }}>
+                  <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Total Money Out (Sales + Divs)</p>
+                  <p style={{ color: '#34d399', fontSize: 24, fontWeight: 700, margin: '8px 0 0' }}>
+                    {fmt(availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.proceeds || 0) + (yearlyPerformance[y]?.dividends || 0), 0))}
+                  </p>
+                </div>
+                <div style={{ padding: 20, borderRadius: 12, backgroundColor: '#0a0d14' }}>
+                  <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Net Invested</p>
+                  <p style={{ color: '#fff', fontSize: 24, fontWeight: 700, margin: '8px 0 0' }}>
+                    {fmt(availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.invested || 0) - (yearlyPerformance[y]?.proceeds || 0) - (yearlyPerformance[y]?.dividends || 0), 0))}
+                  </p>
+                </div>
+                <div style={{ padding: 20, borderRadius: 12, backgroundColor: '#0a0d14' }}>
+                  <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Current Portfolio Value</p>
+                  <p style={{ color: '#fff', fontSize: 24, fontWeight: 700, margin: '8px 0 0' }}>{fmt(metrics.val)}</p>
+                </div>
+                <div style={{ padding: 20, borderRadius: 12, backgroundColor: 'rgba(52,211,153,0.1)', border: '1px solid rgba(52,211,153,0.3)' }}>
+                  <p style={{ color: '#6b7280', fontSize: 12, margin: 0 }}>Total Profit/Loss</p>
+                  {(() => {
+                    const netInvested = availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.invested || 0) - (yearlyPerformance[y]?.proceeds || 0) - (yearlyPerformance[y]?.dividends || 0), 0);
+                    const totalPL = metrics.val - netInvested;
+                    const totalPLPct = netInvested > 0 ? (totalPL / netInvested) * 100 : 0;
+                    return (
+                      <>
+                        <p style={{ color: totalPL >= 0 ? '#34d399' : '#f87171', fontSize: 24, fontWeight: 700, margin: '8px 0 0' }}>{fmt(totalPL)}</p>
+                        <p style={{ color: totalPL >= 0 ? '#34d399' : '#f87171', fontSize: 14, fontWeight: 600, margin: '4px 0 0' }}>{totalPLPct >= 0 ? '+' : ''}{totalPLPct.toFixed(1)}% return</p>
+                      </>
+                    );
+                  })()}
+                </div>
               </div>
             </div>
 
-            {/* Annual Performance Overview */}
+            {/* Historical Year-End Performance */}
+            <div style={{ ...styles.chartCard, marginBottom: 24 }}>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 8 }}>📊 Historical Year-End Performance</h3>
+              <p style={{ color: '#6b7280', fontSize: 13, marginBottom: 20 }}>Portfolio values from fiscal year-end statements (USD + EUR combined)</p>
+              <div style={{ overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid #1e293b' }}>
+                      <th style={{ textAlign: 'left', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Year End</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Portfolio Value</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>YoY Change</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>YoY %</th>
+                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Since 2021</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Object.keys(HISTORICAL_PORTFOLIO_VALUES).sort().map((year, idx, arr) => {
+                      const value = HISTORICAL_PORTFOLIO_VALUES[year].value;
+                      const prevYear = arr[idx - 1];
+                      const prevValue = prevYear ? HISTORICAL_PORTFOLIO_VALUES[prevYear].value : null;
+                      const yoyChange = prevValue ? value - prevValue : null;
+                      const yoyPct = prevValue ? ((value - prevValue) / prevValue) * 100 : null;
+                      const baseValue = HISTORICAL_PORTFOLIO_VALUES['2021'].value;
+                      const cumReturn = ((value - baseValue) / baseValue) * 100;
+                      
+                      return (
+                        <tr key={year} style={{ borderBottom: '1px solid #1e293b' }}>
+                          <td style={{ padding: '14px 8px', fontWeight: 600, color: YEAR_COLORS[year] || '#fff' }}>Dec {year}</td>
+                          <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: '#fff' }}>{fmt(value)}</td>
+                          <td style={{ padding: '14px 8px', textAlign: 'right', color: yoyChange !== null ? (yoyChange >= 0 ? '#34d399' : '#f87171') : '#6b7280' }}>
+                            {yoyChange !== null ? `${yoyChange >= 0 ? '+' : ''}${fmt(yoyChange)}` : '—'}
+                          </td>
+                          <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: yoyPct !== null ? (yoyPct >= 0 ? '#34d399' : '#f87171') : '#6b7280' }}>
+                            {yoyPct !== null ? `${yoyPct >= 0 ? '+' : ''}${yoyPct.toFixed(1)}%` : '—'}
+                          </td>
+                          <td style={{ padding: '14px 8px', textAlign: 'right', color: cumReturn >= 0 ? '#34d399' : '#f87171' }}>
+                            {idx === 0 ? '—' : `${cumReturn >= 0 ? '+' : ''}${cumReturn.toFixed(1)}%`}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {/* Current row */}
+                    <tr style={{ borderBottom: '1px solid #1e293b', backgroundColor: 'rgba(99,102,241,0.1)' }}>
+                      <td style={{ padding: '14px 8px', fontWeight: 600, color: '#6366f1' }}>
+                        Current
+                        <span style={{ fontSize: 11, color: '#6b7280', marginLeft: 8 }}>(Live)</span>
+                      </td>
+                      <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 700, color: '#fff' }}>{fmt(metrics.val)}</td>
+                      {(() => {
+                        const lastYear = '2025';
+                        const lastValue = HISTORICAL_PORTFOLIO_VALUES[lastYear].value;
+                        const yoyChange = metrics.val - lastValue;
+                        const yoyPct = (yoyChange / lastValue) * 100;
+                        const baseValue = HISTORICAL_PORTFOLIO_VALUES['2021'].value;
+                        const cumReturn = ((metrics.val - baseValue) / baseValue) * 100;
+                        return (
+                          <>
+                            <td style={{ padding: '14px 8px', textAlign: 'right', color: yoyChange >= 0 ? '#34d399' : '#f87171' }}>
+                              {yoyChange >= 0 ? '+' : ''}{fmt(yoyChange)}
+                            </td>
+                            <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: yoyPct >= 0 ? '#34d399' : '#f87171' }}>
+                              {yoyPct >= 0 ? '+' : ''}{yoyPct.toFixed(1)}%
+                            </td>
+                            <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: cumReturn >= 0 ? '#34d399' : '#f87171' }}>
+                              {cumReturn >= 0 ? '+' : ''}{cumReturn.toFixed(1)}%
+                            </td>
+                          </>
+                        );
+                      })()}
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* YoY Returns Chart */}
+            <div style={{ ...styles.chartCard, marginBottom: 24 }}>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>Year-over-Year Returns</h3>
+              <div style={{ height: 280 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={[
+                    { year: '2022', pct: -16.9 },
+                    { year: '2023', pct: 77.3 },
+                    { year: '2024', pct: 30.9 },
+                    { year: '2025', pct: 26.1 },
+                    { year: 'YTD', pct: metrics.val > 0 ? ((metrics.val - 26558) / 26558) * 100 : 0 }
+                  ]}>
+                    <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 12 }} />
+                    <YAxis axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={v => `${v.toFixed(0)}%`} />
+                    <Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #374151', borderRadius: 12 }} formatter={v => `${v.toFixed(1)}%`} />
+                    <Bar dataKey="pct" radius={[4, 4, 0, 0]} name="Return %">
+                      {[
+                        { year: '2022', pct: -16.9 },
+                        { year: '2023', pct: 77.3 },
+                        { year: '2024', pct: 30.9 },
+                        { year: '2025', pct: 26.1 },
+                        { year: 'YTD', pct: metrics.val > 0 ? ((metrics.val - 26558) / 26558) * 100 : 0 }
+                      ].map((entry, index) => (
+                        <Cell key={`cell-${index}`} fill={entry.pct >= 0 ? '#34d399' : '#f87171'} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            {/* Annual Activity */}
             <div style={styles.chartCard}>
-              <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>📊 Annual Performance Overview</h3>
+              <h3 style={{ ...styles.chartTitle, marginBottom: 8 }}>📋 Annual Activity</h3>
+              <p style={{ color: '#6b7280', fontSize: 13, marginBottom: 20 }}>Cash flows and trading activity by year</p>
               <div style={{ overflowX: 'auto' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <thead>
@@ -1231,7 +1335,6 @@ export default function PortfolioDashboard() {
                       <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Sold</th>
                       <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Realized Gain</th>
                       <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Dividends</th>
-                      <th style={{ textAlign: 'right', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Div Yield %</th>
                       <th style={{ textAlign: 'center', padding: '12px 8px', color: '#6b7280', fontWeight: 500, fontSize: 13 }}>Trades</th>
                     </tr>
                   </thead>
@@ -1239,11 +1342,6 @@ export default function PortfolioDashboard() {
                     {availableYears.map(year => {
                       const yp = yearlyPerformance[year] || {};
                       const realizedGain = gains.realizedByYear[year] || 0;
-                      // Calculate cumulative invested up to this year for dividend yield
-                      const cumulativeInvested = availableYears
-                        .filter(y => y <= year)
-                        .reduce((sum, y) => sum + (yearlyPerformance[y]?.invested || 0) - (yearlyPerformance[y]?.proceeds || 0), 0);
-                      const divYield = cumulativeInvested > 0 ? (yp.dividends / cumulativeInvested) * 100 : 0;
                       
                       return (
                         <tr key={year} style={{ borderBottom: '1px solid #1e293b' }}>
@@ -1254,9 +1352,6 @@ export default function PortfolioDashboard() {
                             {realizedGain !== 0 ? fmt(realizedGain) : '—'}
                           </td>
                           <td style={{ padding: '14px 8px', textAlign: 'right', color: '#34d399' }}>{fmt(yp.dividends || 0)}</td>
-                          <td style={{ padding: '14px 8px', textAlign: 'right', color: divYield > 0 ? '#34d399' : '#6b7280' }}>
-                            {divYield > 0 ? `${divYield.toFixed(2)}%` : '—'}
-                          </td>
                           <td style={{ padding: '14px 8px', textAlign: 'center', color: '#9ca3af' }}>{yp.trades || 0}</td>
                         </tr>
                       );
@@ -1277,32 +1372,12 @@ export default function PortfolioDashboard() {
                       <td style={{ padding: '14px 8px', textAlign: 'right', fontWeight: 600, color: '#34d399' }}>
                         {fmt(availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.dividends || 0), 0))}
                       </td>
-                      <td style={{ padding: '14px 8px', textAlign: 'right', color: '#6b7280' }}>—</td>
                       <td style={{ padding: '14px 8px', textAlign: 'center', fontWeight: 600, color: '#9ca3af' }}>
                         {availableYears.reduce((s, y) => s + (yearlyPerformance[y]?.trades || 0), 0)}
                       </td>
                     </tr>
                   </tfoot>
                 </table>
-              </div>
-              <p style={{ fontSize: 12, color: '#6b7280', marginTop: 16 }}>
-                💡 Realized Gain = Profit/loss locked in from sales (FIFO method). Does not include unrealized gains from price appreciation.
-              </p>
-            </div>
-
-            {/* Visual Chart */}
-            <div style={{ ...styles.chartCard, marginTop: 24 }}>
-              <h3 style={{ ...styles.chartTitle, marginBottom: 20 }}>Realized Gains & Dividends by Year</h3>
-              <div style={{ height: 280 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={availableYears.map(y => ({ year: y.toString(), realized: gains.realizedByYear[y] || 0, dividends: yearlyPerformance[y]?.dividends || 0 })).reverse()}>
-                    <XAxis dataKey="year" axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 12 }} />
-                    <YAxis axisLine={false} tickLine={false} tick={{ fill: '#6b7280', fontSize: 11 }} tickFormatter={v => `€${(v/1000).toFixed(0)}k`} />
-                    <Tooltip contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #374151', borderRadius: 12 }} formatter={v => fmt(v)} />
-                    <Bar dataKey="realized" fill="#6366f1" radius={[4, 4, 0, 0]} name="Realized Gain" />
-                    <Bar dataKey="dividends" fill="#34d399" radius={[4, 4, 0, 0]} name="Dividends" />
-                  </BarChart>
-                </ResponsiveContainer>
               </div>
             </div>
           </div>
